@@ -1,11 +1,10 @@
 """MojoUI m8 — interactive text->image generation app.
 
 A real, interactive MojoUI desktop app mirroring the egui `inference_ui`
-reference (Image mode only), driven through the Z-Image UI bridge. The default
-backend is still a deterministic CPU stub, so the app can be built and tested
-without GPU access; the same bridge is the handoff point for the real backend.
-Clicking Generate snapshots the params into a queue job, drains worker events
-each frame, uploads completed RGBA results as textures, and pushes history.
+reference (Image mode only), driven through the MojoUI graph executor. Clicking
+Generate snapshots the params into a Comfy-shaped Klein 9B workflow, runs the
+existing pure-Mojo Klein sampler path, uploads the completed PNG as a texture,
+and pushes history.
 
 Layout (3 columns):
   - LEFT params panel: model · resolution · sampling · seed · lora · batch ·
@@ -13,7 +12,7 @@ Layout (3 columns):
   - CENTER canvas: task header · prompt + negative text_area · action bar
     (Generate / Cancel / randomize seed) · generated image preview · progress.
   - RIGHT panel: queue list (running + queued w/ per-job progress) · history ·
-    perf footer (stub constants unless a real backend feeds metrics).
+    perf footer (backend telemetry once the graph runner feeds metrics).
 
 DEFERRED (per M4 scope scope): Video mode (frames/fps), RON persistence
 (state is in-memory only), NVML perf, the controlnet panel, egui-dnd LoRA
@@ -54,23 +53,15 @@ from mojoui.app.inference_model import (
     InferenceState,
     LoraSlot,
 )
-from mojoui.app.inference_zimage_bridge import (
-    ZImageUiRuntime,
-    zimage_submit_current,
-    zimage_cancel_all,
-    zimage_tick_and_apply,
-    zimage_progress_fraction,
+from mojoui.app.inference_graph_bridge import (
+    GraphUiRuntime,
+    dry_run_klein9b_graph,
+    graph_backend_label,
+    graph_cancel_all,
+    graph_progress_fraction,
+    graph_submit_current,
+    graph_tick_and_apply,
 )
-# REAL Z-IMAGE WORKER SEAM (stub backend remains the default).
-# The UI now drives this bridge directly. `_zimage_backend` decides whether the
-# backend is a deterministic CPU stub or the real serenitymojo path.
-from mojoui.app.zimage_worker import (
-    ZImageWorker,
-    ZImageJob,
-    zimage_start,
-    zimage_tick,
-)
-from mojoui.app._zimage_backend import backend_is_real
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +92,7 @@ comptime _STATUS_H: Int32 = 22
 struct InferenceUIState(Movable):
     var ctx: Context
     var model: InferenceState
-    var zrt: ZImageUiRuntime
+    var zrt: GraphUiRuntime
 
     var prompt_edit: MultiLineState
     var negative_edit: MultiLineState
@@ -129,7 +120,7 @@ struct InferenceUIState(Movable):
     def __init__(out self):
         self.ctx = Context()
         self.model = InferenceState()
-        self.zrt = ZImageUiRuntime()
+        self.zrt = GraphUiRuntime()
         self.prompt_edit = MultiLineState()
         self.prompt_edit.set_text(self.model.prompt)
         self.negative_edit = MultiLineState()
@@ -571,10 +562,10 @@ def _center_panel(mut s: InferenceUIState, col_x: Float32) raises:
     label(ctx, String(""))
     if s.model.generating:
         if button(ctx, String("Cancel")):
-            zimage_cancel_all(s.model, s.zrt)
+            graph_cancel_all(s.model, s.zrt)
     else:
         if button_primary(ctx, String("Generate")):
-            zimage_submit_current(s.model, s.zrt)
+            graph_submit_current(s.model, s.zrt)
     if button(ctx, String("Randomize seed")):
         s.pseudo_rng = s.pseudo_rng * UInt32(1664525) + UInt32(1013904223)
         s.model.seed = Float32(Int(s.pseudo_rng % UInt32(1000000)))
@@ -596,7 +587,7 @@ def _center_panel(mut s: InferenceUIState, col_x: Float32) raises:
 
     # progress bar + readout
     ctx.layout_row(_row1(_center_w(s)), _px(s, 18))
-    progress_bar(ctx, zimage_progress_fraction(s.model))
+    progress_bar(ctx, graph_progress_fraction(s.model))
     if s.font_id != 0:
         var readout = String("step ") + String(s.model.current_step) \
             + String("/") + String(s.model.total_steps)
@@ -797,7 +788,7 @@ def _status_bar(mut s: InferenceUIState):
     ctx.draw_rect(Rect(_fpx(s, 10.0), y + (h - dot) * 0.5, dot, dot),
                   Color(90, 200, 120, 255))
     ctx.draw_text(s.font_id, fs, Vec2(_fpx(s, 24.0), ty), Color(150, 150, 165, 255),
-                  String("backend connected  ·  serenitymojo  ·  Z-Image (stub)  ·  ready"))
+                  String("backend connected  ·  serenitymojo  ·  ") + graph_backend_label(s.zrt))
 
 
 def _draw_backgrounds(mut s: InferenceUIState):
@@ -845,23 +836,29 @@ def _dispatch_triangles(mut cmd: CmdTriangles):
 
 
 def _sync_result_texture(mut s: InferenceUIState):
-    """Upload the latest completed worker RGBA buffer once the GL context is live."""
+    """Upload the latest completed graph result once the GL context is live."""
     if s.zrt.result_job_id == UInt64(0):
         return
     if s.zrt.result_job_id == s.zrt.uploaded_job_id:
         return
     if s.zrt.result_width <= 0 or s.zrt.result_height <= 0:
         return
-    if len(s.zrt.result_pixels) == 0:
-        return
     if s.zrt.texture_id != UInt32(0):
         Backend.destroy_texture(s.zrt.texture_id)
         s.zrt.texture_id = UInt32(0)
-    s.zrt.texture_id = Backend.make_texture_rgba(
-        Int32(s.zrt.result_width),
-        Int32(s.zrt.result_height),
-        s.zrt.result_pixels,
-    )
+    if s.zrt.result_path.byte_length() > 0:
+        var loaded = Backend.load_texture_file_info(
+            s.zrt.result_path,
+            Int32(s.zrt.result_width),
+            Int32(s.zrt.result_height),
+        )
+        s.zrt.texture_id = loaded.texture_id
+    elif len(s.zrt.result_pixels) > 0:
+        s.zrt.texture_id = Backend.make_texture_rgba(
+            Int32(s.zrt.result_width),
+            Int32(s.zrt.result_height),
+            s.zrt.result_pixels,
+        )
     if s.zrt.texture_id != UInt32(0):
         s.zrt.uploaded_job_id = s.zrt.result_job_id
 
@@ -878,9 +875,9 @@ def _frame() -> None:
         sp[].ctx.theme.font_id = sp[].font_id
     _sync_window_metrics(sp[])
 
-    # Advance the UI worker one frame BEFORE building the UI so progress and
-    # completed-result textures are current this frame.
-    zimage_tick_and_apply(sp[].model, sp[].zrt)
+    # Advance graph-runtime state before building the UI so completed-result
+    # textures are current this frame.
+    graph_tick_and_apply(sp[].model, sp[].zrt)
     _sync_result_texture(sp[])
 
     sp[].ctx.begin_frame(Vec2(sp[].win_w, sp[].win_h))
@@ -897,31 +894,18 @@ def _frame() -> None:
     Backend.frame_end()
 
 
-def _zimage_seam_selfcheck():
-    """Exercise the real Z-Image worker seam ONCE over the stub backend at
-    startup. This is NOT the live UI driver (the mock above still drives the
-    window); it keeps the real worker + adapter in this build's call graph and
-    proves the protocol (Started→Progress×N→Done) + the RGBA result path link
-    in MojoUI's env. Under the merged GPU env (ZIMAGE_REAL_BACKEND=True) this
-    same path would run a real generation; here it returns a stub gradient."""
-    var w = ZImageWorker()
-    var job = ZImageJob(
-        UInt64(1), String("seam check"), String(""),
-        2, Float32(4.0), Int64(42), 64, 64, UInt32(7),
-    )
-    zimage_start(w, job^)
-    for _ in range(2 * 6 + 2):
-        zimage_tick(w)
-    print(
-        "[zimage-seam] real_backend=", backend_is_real(),
-        " done=", w.done, " events=", len(w.events),
-        " result_ok=", w.result.ok,
-        " progress=", Float32(w.current_step) / Float32(w.total_steps),
-    )
+def _graph_seam_selfcheck():
+    """Compile and dry-run the Klein graph once at startup."""
+    var state = InferenceState()
+    try:
+        var ok = dry_run_klein9b_graph(state)
+        print("[graph-seam] klein9b_graph_dry=", ok, " model=", state.model_label())
+    except e:
+        print("[graph-seam] failed:", String(e))
 
 
 def main() raises:
-    _zimage_seam_selfcheck()
+    _graph_seam_selfcheck()
     var state = InferenceUIState()
     var sp = UnsafePointer(to=state)
     store_user_state(sp)
@@ -940,7 +924,7 @@ def main() raises:
         raise Error("init failed")
 
     print(
-        "Opening inference UI (Z-Image bridge; real_backend=", backend_is_real(),
+        "Opening inference UI (graph executor + Klein 9B",
         ", scale=", state.scale,
         ", window=", Int(state.win_w), "x", Int(state.win_h),
         "). Click Generate to run."
