@@ -15,8 +15,7 @@ Layout (3 columns):
     perf footer (backend telemetry once the graph runner feeds metrics).
 
 DEFERRED (per M4 scope scope): Video mode (frames/fps), RON persistence
-(state is in-memory only), NVML perf, the controlnet panel, egui-dnd LoRA
-reorder.
+(state is in-memory only), the controlnet panel, egui-dnd LoRA reorder.
 
 Build + run: `pixi run inference`. Build-then-run scaffold (text_area /
 combobox / tessellator reach FFI symbols the JIT cannot dlopen); the c50
@@ -133,6 +132,10 @@ struct InferenceUIState(Movable):
     var node_addmenu: AddMenuState
     var node_rename_buffer: String
     var node_rename_state: TextEditState
+    var node_workflow_options: List[String]
+    var node_workflow_paths: List[String]
+    var node_workflow_index: Int32
+    var node_workflow_open: Bool
 
     var prompt_edit: MultiLineState
     var negative_edit: MultiLineState
@@ -151,6 +154,7 @@ struct InferenceUIState(Movable):
     var win_w: Float32
     var win_h: Float32
     var scale: Float32
+    var perf_refresh_tick: Int32
 
     # chrome state
     var tab: Int32           # 0 = Image, 1 = Video, 2 = Nodes
@@ -171,6 +175,11 @@ struct InferenceUIState(Movable):
         self.node_addmenu = AddMenuState()
         self.node_rename_buffer = String("")
         self.node_rename_state = TextEditState(single_line=True)
+        self.node_workflow_options = List[String]()
+        self.node_workflow_paths = List[String]()
+        _populate_node_workflow_presets(self.node_workflow_options, self.node_workflow_paths)
+        self.node_workflow_index = 0
+        self.node_workflow_open = False
         self.prompt_edit = MultiLineState()
         self.prompt_edit.set_text(self.model.prompt)
         self.negative_edit = MultiLineState()
@@ -187,6 +196,7 @@ struct InferenceUIState(Movable):
         self.win_w = _WIN_W
         self.win_h = _WIN_H
         self.scale = 1.0
+        self.perf_refresh_tick = 1000
         self.tab = 0
         self.theme_dark = True
         self.open_menu = -1
@@ -220,6 +230,87 @@ def _row3(a: Int32, b: Int32, c: Int32) -> List[Int32]:
     return w^
 
 
+def _add_node_workflow_preset(
+    mut names: List[String],
+    mut paths: List[String],
+    label: String,
+    path: String,
+):
+    names.append(label.copy())
+    paths.append(path.copy())
+
+
+def _populate_node_workflow_presets(mut names: List[String], mut paths: List[String]):
+    _add_node_workflow_preset(
+        names, paths,
+        String("Main screen / Klein 9B graph"),
+        String("builtin:klein"),
+    )
+    _add_node_workflow_preset(
+        names, paths,
+        String("Downloads / Ideogram image test"),
+        String("/home/alex/Downloads/image_ideogram4_t2i.json"),
+    )
+
+    var sf = String("/home/alex/serenityflow-v2/serenityflow/workflows/")
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Flux 1 Dev edit"), sf + String("flux1_dev_edit.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Flux 1 Dev edit LoRA"), sf + String("flux1_dev_edit_lora.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Flux 1 Dev t2i"), sf + String("flux1_dev_t2i.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Flux 1 Dev t2i LoRA"), sf + String("flux1_dev_t2i_lora.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Flux 2 Dev edit"), sf + String("flux2_dev_edit.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Flux 2 Dev edit LoRA"), sf + String("flux2_dev_edit_lora.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Flux 2 Dev t2i"), sf + String("flux2_dev_t2i.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Flux 2 Dev t2i LoRA"), sf + String("flux2_dev_t2i_lora.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Klein 4B edit"), sf + String("klein4b_edit.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Klein 4B edit LoRA"), sf + String("klein4b_edit_lora.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Klein 4B t2i"), sf + String("klein4b_t2i.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Klein 4B t2i LoRA"), sf + String("klein4b_t2i_lora.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Klein 9B edit"), sf + String("klein9b_edit.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Klein 9B edit LoRA"), sf + String("klein9b_edit_lora.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Klein 9B t2i"), sf + String("klein9b_t2i.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Klein 9B t2i LoRA"), sf + String("klein9b_t2i_lora.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / LTX 2.3 a2v"), sf + String("ltx23_a2v.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / LTX 2.3 i2v"), sf + String("ltx23_i2v.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / LTX 2.3 ia2v"), sf + String("ltx23_ia2v.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / LTX 2.3 fp8 a2v"), sf + String("ltx23_serenityfp8_a2v.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / LTX 2.3 fp8 i2v"), sf + String("ltx23_serenityfp8_i2v.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / LTX 2.3 fp8 ia2v"), sf + String("ltx23_serenityfp8_ia2v.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / LTX 2.3 fp8 t2v"), sf + String("ltx23_serenityfp8_t2v.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / LTX 2.3 t2v"), sf + String("ltx23_t2v.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Qwen edit"), sf + String("qwen_edit.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Qwen edit LoRA"), sf + String("qwen_edit_lora.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Qwen Image t2i"), sf + String("qwen_image_t2i.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Qwen Image t2i LoRA"), sf + String("qwen_image_t2i_lora.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / SD 3.5 Large t2i"), sf + String("sd35_large_t2i.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / SDXL t2i"), sf + String("sdxl_t2i.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Wan 2.2 i2v"), sf + String("wan22_i2v.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Wan 2.2 i2v LoRA"), sf + String("wan22_i2v_lora.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Wan 2.2 t2v"), sf + String("wan22_t2v.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Wan 2.2 t2v LoRA"), sf + String("wan22_t2v_lora.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Wan 2.3 i2v"), sf + String("wan23_i2v.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Wan 2.3 i2v LoRA"), sf + String("wan23_i2v_lora.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Wan 2.3 t2v"), sf + String("wan23_t2v.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Wan 2.3 t2v LoRA"), sf + String("wan23_t2v_lora.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Z-Image t2i"), sf + String("zimage_t2i.json"))
+    _add_node_workflow_preset(names, paths, String("SerenityFlow / Z-Image t2i LoRA"), sf + String("zimage_t2i_lora.json"))
+
+    var sw = String("/home/alex/SwarmUI/dlbackend/ComfyUI/blueprints/")
+    _add_node_workflow_preset(names, paths, String("Comfy/Swarm / Text to Image"), sw + String("Text to Image.json"))
+    _add_node_workflow_preset(names, paths, String("Comfy/Swarm / Text to Image Qwen"), sw + String("Text to Image (Qwen-Image).json"))
+    _add_node_workflow_preset(names, paths, String("Comfy/Swarm / Text to Image Qwen 2512"), sw + String("Text to Image (Qwen-Image 2512).json"))
+    _add_node_workflow_preset(names, paths, String("Comfy/Swarm / Text to Image Flux 2 Dev"), sw + String("Text to Image (Flux.2 Dev).json"))
+    _add_node_workflow_preset(names, paths, String("Comfy/Swarm / Text to Image Z-Image Turbo"), sw + String("Text to Image (Z-Image-Turbo).json"))
+    _add_node_workflow_preset(names, paths, String("Comfy/Swarm / Image Edit Klein 4B"), sw + String("Image Edit (Flux.2 Klein 4B).json"))
+    _add_node_workflow_preset(names, paths, String("Comfy/Swarm / Image Edit Qwen 2511"), sw + String("Image Edit (Qwen 2511).json"))
+    _add_node_workflow_preset(names, paths, String("Comfy/Swarm / Image to Video Wan 2.2"), sw + String("Image to Video (Wan 2.2).json"))
+    _add_node_workflow_preset(names, paths, String("Comfy/Swarm / Text to Video Wan 2.2"), sw + String("Text to Video (Wan 2.2).json"))
+    _add_node_workflow_preset(names, paths, String("Comfy/Swarm / First Last Frame LTX 2.3"), sw + String("First-Last-Frame to Video (LTX-2.3).json"))
+    _add_node_workflow_preset(names, paths, String("Comfy/Swarm / Canny to Video LTX 2.0"), sw + String("Canny to Video (LTX 2.0).json"))
+    _add_node_workflow_preset(names, paths, String("Comfy/Swarm / ControlNet Z-Image Turbo"), sw + String("ControlNet (Z-Image-Turbo).json"))
+    _add_node_workflow_preset(names, paths, String("Comfy/Swarm / Image Inpainting Qwen"), sw + String("Image Inpainting (Qwen-image).json"))
+    _add_node_workflow_preset(names, paths, String("Comfy/Swarm / Prompt Enhance"), sw + String("Prompt Enhance.json"))
+
+
 def _clamp_scale(v: Float32) -> Float32:
     if v < 1.0:
         return 1.0
@@ -235,6 +326,33 @@ def _scale_for(win_w: Float32, win_h: Float32) -> Float32:
     if sy < s:
         s = sy
     return _clamp_scale(s)
+
+
+def _gb_text(value: Float32) -> String:
+    var tenths = Int(value * 10.0 + 0.5)
+    var whole = tenths / 10
+    var frac = tenths - whole * 10
+    return String(whole) + String(".") + String(frac)
+
+
+def _refresh_perf_telemetry(mut s: InferenceUIState):
+    s.perf_refresh_tick = s.perf_refresh_tick + 1
+    if s.perf_refresh_tick < 60:
+        return
+    s.perf_refresh_tick = 0
+    var metrics = Backend.system_metrics()
+    if metrics.gpu_available:
+        s.model.perf.gpu_name = metrics.gpu_name.copy()
+        s.model.perf.vram_used_gb = Float32(metrics.gpu_memory_used_mb) / 1024.0
+        s.model.perf.vram_total_gb = Float32(metrics.gpu_memory_total_mb) / 1024.0
+        s.model.perf.gpu_util_pct = Float32(metrics.gpu_util_percent)
+        s.model.perf.temperature_c = Float32(metrics.gpu_temperature_c)
+    else:
+        s.model.perf.gpu_name = String("GPU telemetry unavailable")
+        s.model.perf.vram_used_gb = 0.0
+        s.model.perf.vram_total_gb = 0.0
+        s.model.perf.gpu_util_pct = 0.0
+        s.model.perf.temperature_c = 0.0
 
 
 def _px_scale(scale: Float32, value: Int32) -> Int32:
@@ -375,15 +493,19 @@ def _node_display_job(model: InferenceState) -> QueueJob:
     )
 
 
-def _build_serenity_node_graph(model: InferenceState) raises -> Graph:
+def _build_fresh_klein9b_node_graph(model: InferenceState) raises -> Graph:
     var display = _node_display_job(model)
-    var g = build_klein9b_inference_graph(
+    return build_klein9b_inference_graph(
         model,
         display,
         String("/home/alex/mojodiffusion/output/serenityui_klein9b_nodes.png"),
         Int32(1024),
         Int32(1024),
     )
+
+
+def _build_serenity_node_graph(model: InferenceState) raises -> Graph:
+    var g = _build_fresh_klein9b_node_graph(model)
     try:
         var file = open(String(_NODE_PERSIST_WORKFLOW), String("r"))
         var saved = parse_workflow(file.read())
@@ -755,8 +877,8 @@ def _right_panel(mut s: InferenceUIState, col_x: Float32) raises:
                       Color(170, 175, 190, 255), s.model.perf.gpu_name)
         ctx.draw_text(s.font_id, _font_body(s), Vec2(col_x, y + _fpx(s, 20.0)),
                       Color(170, 175, 190, 255),
-                      String("VRAM ") + String(Int(s.model.perf.vram_used_gb))
-                      + String("/") + String(Int(s.model.perf.vram_total_gb)) + String(" GB"))
+                      String("VRAM ") + _gb_text(s.model.perf.vram_used_gb)
+                      + String("/") + _gb_text(s.model.perf.vram_total_gb) + String(" GB"))
         ctx.draw_text(s.font_id, _font_body(s), Vec2(col_x, y + _fpx(s, 40.0)),
                       Color(170, 175, 190, 255),
                       String("Util ") + String(Int(s.model.perf.gpu_util_pct)) + String("%"))
@@ -941,21 +1063,72 @@ def _node_add_demo_image(mut s: InferenceUIState) raises:
     s.menu_status = String("added image node")
 
 
-def _node_import_comfy_json(mut s: InferenceUIState) raises:
-    var file = open(String("/home/alex/Downloads/image_ideogram4_t2i.json"), String("r"))
+def _node_load_fresh_klein_graph(mut s: InferenceUIState) raises:
+    s.node_graph = _build_fresh_klein9b_node_graph(s.model)
+    s.node_canvas = _build_serenity_node_canvas(s.node_graph)
+    s.node_canvas.show_minimap = True
+    s.node_canvas.snap_to_grid = True
+    s.node_progress.reset()
+    s.menu_status = String("loaded main Klein 9B node graph")
+
+
+def _node_import_comfy_json_path(
+    mut s: InferenceUIState,
+    path: String,
+    label_text: String,
+) raises:
+    var file = open(path, String("r"))
     var imported = parse_comfy_workflow(file.read())
     s.node_graph = imported.take_graph()
     s.node_canvas = imported.take_canvas()
     s.node_canvas.show_minimap = True
     s.node_canvas.snap_to_grid = True
     s.node_progress.reset()
-    s.menu_status = String("imported Comfy workflow JSON")
+    s.menu_status = String("loaded ") + label_text
+
+
+def _node_load_selected_workflow(mut s: InferenceUIState) raises:
+    var idx = Int(s.node_workflow_index)
+    if idx < 0 or idx >= len(s.node_workflow_paths):
+        s.menu_status = String("workflow preset index out of range")
+        return
+    var path = s.node_workflow_paths[idx].copy()
+    var label_text = s.node_workflow_options[idx].copy()
+    if path == String("builtin:klein"):
+        _node_load_fresh_klein_graph(s)
+    else:
+        _node_import_comfy_json_path(s, path, label_text)
 
 
 def _nodes_panel(mut s: InferenceUIState, body_h: Float32) raises:
     ref ctx = s.ctx
     var renaming = s.node_canvas.renaming_node != UInt64(0)
+    var changed = False
     var used_h = Int32(0)
+
+    var load_w = _px(s, 110)
+    var main_w = _px(s, 150)
+    var preset_w = Int32(Int(s.win_w)) - load_w - main_w - _px(s, 38)
+    if preset_w < _px(s, 360):
+        preset_w = _px(s, 360)
+    ctx.layout_row(_row3(preset_w, load_w, main_w), _px(s, 34))
+    if combobox(
+        ctx,
+        String("node_workflow_preset"),
+        s.node_workflow_options,
+        s.node_workflow_index,
+        s.node_workflow_open,
+    ):
+        s.menu_status = String("selected workflow preset")
+    if button_primary(ctx, String("Load")):
+        _node_load_selected_workflow(s)
+        changed = True
+    if button(ctx, String("Main Graph")):
+        s.node_workflow_index = 0
+        _node_load_selected_workflow(s)
+        changed = True
+    used_h = used_h + _px(s, 38)
+
     if renaming:
         var rw = List[Int32]()
         rw.append(Int32(Int(s.win_w)))
@@ -969,7 +1142,8 @@ def _nodes_panel(mut s: InferenceUIState, body_h: Float32) raises:
     if canvas_h < _px(s, 120):
         canvas_h = _px(s, 120)
     ctx.layout_row(cw^, canvas_h)
-    var changed = begin_node_canvas(ctx, String("serenity_nodes"), s.node_canvas, s.node_graph)
+    if begin_node_canvas(ctx, String("serenity_nodes"), s.node_canvas, s.node_graph):
+        changed = True
     end_node_canvas(ctx)
 
     if s.node_canvas.generate_requested:
@@ -979,7 +1153,11 @@ def _nodes_panel(mut s: InferenceUIState, body_h: Float32) raises:
         _node_add_demo_image(s)
         changed = True
     if s.node_canvas.import_json_requested:
-        _node_import_comfy_json(s)
+        _node_import_comfy_json_path(
+            s,
+            String("/home/alex/Downloads/image_ideogram4_t2i.json"),
+            String("Downloads / Ideogram image test"),
+        )
         changed = True
 
     if ctx.input.mouse_pressed(MOJOUI_BTN_RIGHT) and not s.node_canvas.ctx_menu_open:
@@ -1113,6 +1291,7 @@ def _frame() -> None:
     # Advance graph-runtime state before building the UI so completed-result
     # textures are current this frame.
     graph_tick_and_apply(sp[].model, sp[].zrt)
+    _refresh_perf_telemetry(sp[])
     _sync_result_texture(sp[])
 
     sp[].ctx.begin_frame(Vec2(sp[].win_w, sp[].win_h))
