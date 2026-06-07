@@ -63,11 +63,13 @@ from mojoui.app.inference_graph_bridge import (
     GraphUiRuntime,
     build_klein9b_inference_graph,
     dry_run_klein9b_graph,
+    graph_has_port_metadata,
     graph_backend_label,
     graph_cancel_all,
     graph_progress_fraction,
     graph_submit_current,
     graph_tick_and_apply,
+    merge_saved_node_layout,
     _sys_system,
     _write_text_file,
 )
@@ -386,7 +388,12 @@ def _build_serenity_node_graph(model: InferenceState) raises -> Graph:
         var file = open(String(_NODE_PERSIST_WORKFLOW), String("r"))
         var saved = parse_workflow(file.read())
         if saved.node_count() > 0:
-            g = saved^
+            if graph_has_port_metadata(saved):
+                g = saved^
+            else:
+                var matched = merge_saved_node_layout(g, saved)
+                if matched == saved.node_count():
+                    _write_text_file(String(_NODE_PERSIST_WORKFLOW), emit_workflow(g))
     except e:
         pass
     return g^
