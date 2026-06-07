@@ -2,7 +2,6 @@
 set -euo pipefail
 
 app_bin=/tmp/serenity_ui
-graph_bin=/tmp/mojoui_m6_nodegraph
 
 needs_rebuild() {
     local bin=$1
@@ -29,25 +28,4 @@ if needs_rebuild "$app_bin" \
     mv "${app_bin}.next" "$app_bin"
 fi
 
-if needs_rebuild "$graph_bin" \
-    /home/alex/MojoUI/examples/m6_nodegraph.mojo \
-    /home/alex/MojoUI/mojoui/core \
-    /home/alex/MojoUI/mojoui/render \
-    /home/alex/MojoUI/mojoui/widgets \
-    /home/alex/MojoUI/mojoui/nodes \
-    /home/alex/MojoUI/mojoui/serde \
-    /home/alex/MojoUI/mojoui/app/state.mojo; then
-    (
-        cd /home/alex/MojoUI
-        mojo build \
-            -I . \
-            -Xlinker -L. \
-            -Xlinker -lmojoui_floor \
-            -Xlinker -lm \
-            examples/m6_nodegraph.mojo \
-            -o "${graph_bin}.next"
-    )
-    mv "${graph_bin}.next" "$graph_bin"
-fi
-
-echo "READY $app_bin $graph_bin"
+echo "READY $app_bin"

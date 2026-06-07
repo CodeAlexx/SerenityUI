@@ -24,10 +24,12 @@ user_data extension carries persistent state across frames; the post-run
 keep-alive print prevents ASAP-destruction from freeing state early.
 """
 
+from std.io.file import open
 from std.memory import UnsafePointer
 from mojoui.core.types import Vec2, Rect, Color
 from mojoui.core.context import Context
 from mojoui.core.control import CTRL_HOVERED, CTRL_RELEASED, OPT_NONE
+from mojoui.core.textedit import TextEditState
 from mojoui.core.commands import (
     CMD_JUMP, CMD_RECT, CMD_TEXT, CMD_IMAGE, CMD_TRIANGLES,
     CmdTriangles, read_cmd_rect, read_cmd_text, read_cmd_image,
@@ -37,10 +39,13 @@ from mojoui.core.multiline_edit import MultiLineState
 from mojoui.render.backend import Backend
 from mojoui.render.command_renderer import render_context_commands
 from mojoui.render.ffi import (
+    MOJOUI_BTN_RIGHT,
     MOJOUI_KEY_RETURN,
+    MOJOUI_KEY_ESCAPE,
 )
 from mojoui.widgets.basic import button, button_primary, label, separator
 from mojoui.widgets.text_area import text_area
+from mojoui.widgets.text_edit import text_edit
 from mojoui.widgets.combobox import combobox
 from mojoui.widgets.slider import slider
 from mojoui.widgets.drag_value import drag_value
@@ -52,17 +57,40 @@ from mojoui.app.state import store_user_state, retrieve_user_state
 from mojoui.app.inference_model import (
     InferenceState,
     LoraSlot,
+    QueueJob,
 )
 from mojoui.app.inference_graph_bridge import (
     GraphUiRuntime,
+    build_klein9b_inference_graph,
     dry_run_klein9b_graph,
     graph_backend_label,
     graph_cancel_all,
     graph_progress_fraction,
     graph_submit_current,
     graph_tick_and_apply,
+    _sys_system,
+    _write_text_file,
 )
-from mojoui.app.nodegraph_launcher import launch_comfy_nodegraph
+from mojoui.nodes.node import FieldValue
+from mojoui.nodes.graph import Graph
+from mojoui.nodes.registry import NodeRegistry, register_builtins
+from mojoui.nodes.canvas_model import (
+    CanvasGroup,
+    CanvasState,
+    canvas_screen_to_world,
+)
+from mojoui.nodes.canvas import begin_node_canvas, end_node_canvas
+from mojoui.nodes.add_menu import AddMenuState, add_menu
+from mojoui.nodes.node_menu import (
+    node_context_menu,
+    NODE_ACTION_DELETE,
+    NODE_ACTION_DUPLICATE,
+    NODE_ACTION_RENAME,
+    NODE_ACTION_COLOR,
+)
+from mojoui.nodes.progress import ProgressState, draw_progress_overlay
+from mojoui.serde.comfy_workflow import parse_comfy_workflow
+from mojoui.serde.workflow import emit_workflow, parse_workflow
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +110,8 @@ comptime _CENTER_W: Int32 = 1500 - 380 - 360 - 48
 comptime _TITLE_H: Int32 = 32
 comptime _MENU_H: Int32 = 34
 comptime _STATUS_H: Int32 = 22
+comptime _NODE_PERSIST_DIR = "/home/alex/.cache/serenityui"
+comptime _NODE_PERSIST_WORKFLOW = "/home/alex/.cache/serenityui/klein9b_nodegraph.workflow.json"
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +124,13 @@ struct InferenceUIState(Movable):
     var ctx: Context
     var model: InferenceState
     var zrt: GraphUiRuntime
+    var node_registry: NodeRegistry
+    var node_graph: Graph
+    var node_canvas: CanvasState
+    var node_progress: ProgressState
+    var node_addmenu: AddMenuState
+    var node_rename_buffer: String
+    var node_rename_state: TextEditState
 
     var prompt_edit: MultiLineState
     var negative_edit: MultiLineState
@@ -114,15 +151,24 @@ struct InferenceUIState(Movable):
     var scale: Float32
 
     # chrome state
-    var tab: Int32           # 0 = Image, 1 = Video
+    var tab: Int32           # 0 = Image, 1 = Video, 2 = Nodes
     var theme_dark: Bool     # dark/light toggle in the menu bar
     var open_menu: Int32     # menu-bar dropdown open index (-1 = none)
     var menu_status: String
 
-    def __init__(out self):
+    def __init__(out self) raises:
         self.ctx = Context()
         self.model = InferenceState()
         self.zrt = GraphUiRuntime()
+        var registry = NodeRegistry()
+        register_builtins(registry)
+        self.node_registry = registry^
+        self.node_graph = _build_serenity_node_graph(self.model)
+        self.node_canvas = _build_serenity_node_canvas(self.node_graph)
+        self.node_progress = ProgressState()
+        self.node_addmenu = AddMenuState()
+        self.node_rename_buffer = String("")
+        self.node_rename_state = TextEditState(single_line=True)
         self.prompt_edit = MultiLineState()
         self.prompt_edit.set_text(self.model.prompt)
         self.negative_edit = MultiLineState()
@@ -312,6 +358,65 @@ def _initial_window_size() -> Vec2:
     if h < _WIN_H:
         h = _WIN_H
     return Vec2(w, h)
+
+
+def _node_display_job(model: InferenceState) -> QueueJob:
+    return QueueJob(
+        UInt64(1),
+        model.prompt.copy(),
+        Int32(Int(model.width)),
+        Int32(Int(model.height)),
+        Int32(Int(model.steps)),
+        model.sampler_label(),
+        Int64(-1),
+        UInt32(0),
+    )
+
+
+def _build_serenity_node_graph(model: InferenceState) raises -> Graph:
+    var display = _node_display_job(model)
+    var g = build_klein9b_inference_graph(
+        model,
+        display,
+        String("/home/alex/mojodiffusion/output/serenityui_klein9b_nodes.png"),
+        Int32(1024),
+        Int32(1024),
+    )
+    try:
+        var file = open(String(_NODE_PERSIST_WORKFLOW), String("r"))
+        var saved = parse_workflow(file.read())
+        if saved.node_count() > 0:
+            g = saved^
+    except e:
+        pass
+    return g^
+
+
+def _build_serenity_node_canvas(graph: Graph) -> CanvasState:
+    var canvas = CanvasState()
+    canvas.pan = Vec2(110.0, 115.0)
+    canvas.zoom = Float32(1.30)
+    canvas.show_minimap = True
+    canvas.snap_to_grid = True
+    var group = CanvasGroup(
+        Int64(1),
+        String("SerenityUI Klein 9B Generate Workflow"),
+        Rect(20.0, 35.0, 2500.0, 840.0),
+        Color(64, 118, 210, 68),
+    )
+    for i in range(graph.node_count()):
+        group.members.append(graph.nodes[i].id)
+    canvas.groups.append(group^)
+    canvas.next_group_id = Int64(2)
+    return canvas^
+
+
+def _autosave_node_workflow(s: InferenceUIState):
+    try:
+        _ = _sys_system(String("mkdir -p ") + String(_NODE_PERSIST_DIR))
+        _write_text_file(String(_NODE_PERSIST_WORKFLOW), emit_workflow(s.node_graph))
+    except e:
+        pass
 
 
 def _sync_window_metrics(mut s: InferenceUIState):
@@ -726,11 +831,8 @@ def _menu_bar(mut s: InferenceUIState):
         var flags = ctx.update_control(mid, brect.copy(), OPT_NONE)
         if (flags & CTRL_RELEASED) != 0:
             if lbl == String("Nodes"):
-                var rc = launch_comfy_nodegraph()
-                if rc == 0:
-                    s.menu_status = String("nodes graph opening")
-                else:
-                    s.menu_status = String("nodes launch failed: ") + String(rc)
+                s.tab = Int32(2)
+                s.menu_status = String("nodes graph view")
         if (flags & CTRL_HOVERED) != 0:
             ctx.draw_rect(brect.copy(), ctx.theme.hover_bg.copy())
         ctx.draw_text(s.font_id, fs, Vec2(x + _fpx(s, 8.0), ty),
@@ -747,6 +849,7 @@ def _menu_bar(mut s: InferenceUIState):
     var tabs = List[String]()
     tabs.append(String("Image"))
     tabs.append(String("Video"))
+    tabs.append(String("Nodes"))
     for i in range(len(tabs)):
         var lbl = tabs[i]
         var bw = _chrome_text_w(s, lbl, fs) + _fpx(s, 20.0)
@@ -815,8 +918,114 @@ def _draw_backgrounds(mut s: InferenceUIState):
                   Color(28, 28, 36, 255))
 
 
+def _node_add_demo_image(mut s: InferenceUIState) raises:
+    var node_id = s.node_graph.id_alloc.alloc()
+    var pos = s.node_canvas.action_anchor_world.copy()
+    var node = s.node_registry.make_node(String("core/load_image"), pos.copy(), node_id)
+    node.title = String("Image Node")
+    node.size = Vec2(360.0, 360.0)
+    node.fields[String("path")] = FieldValue.string(
+        String("/home/alex/Downloads/image (17).webp")
+    )
+    node.fields[String("upload_label")] = FieldValue.string(
+        String("SerenityUI reference image")
+    )
+    s.node_graph.nodes.append(node^)
+    s.menu_status = String("added image node")
+
+
+def _node_import_comfy_json(mut s: InferenceUIState) raises:
+    var file = open(String("/home/alex/Downloads/image_ideogram4_t2i.json"), String("r"))
+    var imported = parse_comfy_workflow(file.read())
+    s.node_graph = imported.take_graph()
+    s.node_canvas = imported.take_canvas()
+    s.node_canvas.show_minimap = True
+    s.node_canvas.snap_to_grid = True
+    s.node_progress.reset()
+    s.menu_status = String("imported Comfy workflow JSON")
+
+
+def _nodes_panel(mut s: InferenceUIState, body_h: Float32) raises:
+    ref ctx = s.ctx
+    var renaming = s.node_canvas.renaming_node != UInt64(0)
+    var used_h = Int32(0)
+    if renaming:
+        var rw = List[Int32]()
+        rw.append(Int32(Int(s.win_w)))
+        ctx.layout_row(rw^, _px(s, 38))
+        _ = text_edit(ctx, String("node_rename_field"), s.node_rename_buffer, s.node_rename_state)
+        used_h = _px(s, 38)
+
+    var cw = List[Int32]()
+    cw.append(Int32(Int(s.win_w)))
+    var canvas_h = Int32(Int(body_h)) - used_h
+    if canvas_h < _px(s, 120):
+        canvas_h = _px(s, 120)
+    ctx.layout_row(cw^, canvas_h)
+    var changed = begin_node_canvas(ctx, String("serenity_nodes"), s.node_canvas, s.node_graph)
+    end_node_canvas(ctx)
+
+    if s.node_canvas.generate_requested:
+        graph_submit_current(s.model, s.zrt)
+        s.menu_status = String("running Klein 9B graph from Nodes")
+    if s.node_canvas.add_image_requested:
+        _node_add_demo_image(s)
+        changed = True
+    if s.node_canvas.import_json_requested:
+        _node_import_comfy_json(s)
+        changed = True
+
+    if ctx.input.mouse_pressed(MOJOUI_BTN_RIGHT) and not s.node_canvas.ctx_menu_open:
+        var mp = ctx.control.mouse_pos.copy()
+        if mp.y > Float32(Int(_top_chrome(s))):
+            var world = canvas_screen_to_world(s.node_canvas, mp.copy())
+            s.node_addmenu.show_at(mp.copy(), world)
+    if s.node_canvas.ctx_menu_open:
+        s.node_addmenu.hide()
+
+    var act = node_context_menu(ctx, String("serenity_node_ctx"), s.node_canvas, s.node_graph)
+    if act == NODE_ACTION_DELETE:
+        s.menu_status = String("deleted node")
+        changed = True
+    elif act == NODE_ACTION_DUPLICATE:
+        s.menu_status = String("duplicated node")
+        changed = True
+    elif act == NODE_ACTION_RENAME:
+        var idx = s.node_graph.find_node(s.node_canvas.renaming_node)
+        if idx >= 0:
+            s.node_rename_buffer = s.node_graph.nodes[idx].title.copy()
+            s.node_rename_state = TextEditState(single_line=True)
+        s.menu_status = String("renaming node")
+    elif act == NODE_ACTION_COLOR:
+        s.menu_status = String("cycled node color")
+        changed = True
+
+    if add_menu(ctx, String("serenity_add_menu"), s.node_addmenu, s.node_registry, s.node_graph):
+        s.menu_status = String("added node")
+        changed = True
+
+    if renaming:
+        if ctx.input.key_pressed(MOJOUI_KEY_RETURN):
+            var idx = s.node_graph.find_node(s.node_canvas.renaming_node)
+            if idx >= 0:
+                s.node_graph.nodes[idx].title = s.node_rename_buffer.copy()
+            s.node_canvas.renaming_node = UInt64(0)
+            s.menu_status = String("renamed node")
+            changed = True
+        elif ctx.input.key_pressed(MOJOUI_KEY_ESCAPE):
+            s.node_canvas.renaming_node = UInt64(0)
+            s.menu_status = String("rename cancelled")
+
+    _ = draw_progress_overlay(ctx, s.node_canvas, s.node_graph, s.node_progress)
+    if changed:
+        _autosave_node_workflow(s)
+
+
 def _ui(mut s: InferenceUIState) raises:
-    _draw_backgrounds(s)
+    if s.tab != Int32(2):
+        _draw_backgrounds(s)
+    else:
+        s.ctx.draw_rect(Rect(0.0, 0.0, s.win_w, s.win_h), Color(22, 22, 28, 255))
     var left_w = Float32(Int(_left_w(s)))
     var center_x = left_w + _fpx(s, 16.0)
     var center_w = Float32(Int(_center_w(s)))
@@ -824,17 +1033,22 @@ def _ui(mut s: InferenceUIState) raises:
     var top_y = Float32(Int(_top_chrome(s)))
     var body_h = s.win_h - top_y - Float32(Int(_status_h(s)))
 
-    s.ctx.begin_panel(Rect(0.0, top_y, left_w, body_h))
-    _left_panel(s)
-    s.ctx.end_panel()
+    if s.tab == Int32(2):
+        s.ctx.begin_panel(Rect(0.0, top_y, s.win_w, body_h))
+        _nodes_panel(s, body_h)
+        s.ctx.end_panel()
+    else:
+        s.ctx.begin_panel(Rect(0.0, top_y, left_w, body_h))
+        _left_panel(s)
+        s.ctx.end_panel()
 
-    s.ctx.begin_panel(Rect(center_x, top_y, center_w, body_h))
-    _center_panel(s, center_x + _fpx(s, 8.0))
-    s.ctx.end_panel()
+        s.ctx.begin_panel(Rect(center_x, top_y, center_w, body_h))
+        _center_panel(s, center_x + _fpx(s, 8.0))
+        s.ctx.end_panel()
 
-    s.ctx.begin_panel(Rect(right_x, top_y, Float32(Int(_right_w(s))), body_h))
-    _right_panel(s, right_x + _fpx(s, 12.0))
-    s.ctx.end_panel()
+        s.ctx.begin_panel(Rect(right_x, top_y, Float32(Int(_right_w(s))), body_h))
+        _right_panel(s, right_x + _fpx(s, 12.0))
+        s.ctx.end_panel()
 
     # Chrome drawn last so it sits above panel backgrounds + content.
     # (Title bar is the native OS bar — see _top_chrome. _title_bar() is kept
