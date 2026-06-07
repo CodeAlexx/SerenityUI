@@ -1,0 +1,31 @@
+[workspace]
+name = "serenityUI"
+version = "0.1.0-alpha"
+description = "serenityUI — pure-Mojo text->image / video inference desktop app. MojoUI front-end + serenitymojo inference. No Rust."
+authors = ["Alex"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+# Same Mojo/MAX toolchain MojoUI + serenitymojo build against.
+modular = ">=26.1.0.dev2025122205,<27"
+imagemagick = ">=7.1.2_24,<8"
+
+# serenityUI imports two sibling repos from where they live (Option B — no
+# vendoring, lib fixes flow in):
+#   MojoUI       -> the GUI library  (package `mojoui`, plus libmojoui_floor.so)
+#   serenitymojo -> the inference runtime (package `serenitymojo`)
+# Include paths and the C-floor link are wired into the build task below.
+[activation.env]
+MOJOUI_DIR = "/home/alex/MojoUI"
+SERENITYMOJO_DIR = "/home/alex/mojodiffusion"
+
+[tasks]
+# Build the app to a real binary (NOT `mojo run`/JIT): MojoUI's interactive
+# widgets reach C-floor FFI symbols the JIT cannot dlopen, so we link
+# libmojoui_floor.so at compile time — same build-then-run shape MojoUI's
+# own examples use.
+build = { cmd = "mojo build -I . -I /home/alex/MojoUI -I /home/alex/mojodiffusion -Xlinker -L/home/alex/MojoUI -Xlinker -lmojoui_floor -Xlinker -lm src/serenity_ui_main.mojo -o /tmp/serenity_ui && echo BUILT /tmp/serenity_ui" }
+
+# Run the windowed app. LD_LIBRARY_PATH points the loader at MojoUI's C floor.
+run = { cmd = "LD_LIBRARY_PATH=/home/alex/MojoUI /tmp/serenity_ui", depends-on = ["build"] }

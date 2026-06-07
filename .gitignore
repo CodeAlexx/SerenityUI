@@ -1,0 +1,5 @@
+.pixi/
+*.so
+/tmp/
+__pycache__/
+*.pyc
