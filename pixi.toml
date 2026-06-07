@@ -25,7 +25,7 @@ SERENITYMOJO_DIR = "/home/alex/mojodiffusion"
 # widgets reach C-floor FFI symbols the JIT cannot dlopen, so we link
 # libmojoui_floor.so at compile time — same build-then-run shape MojoUI's
 # own examples use.
-build = { cmd = "mojo build -I . -I /home/alex/MojoUI -I /home/alex/mojodiffusion -Xlinker -L/home/alex/MojoUI -Xlinker -lmojoui_floor -Xlinker -lm src/serenity_ui_main.mojo -o /tmp/serenity_ui && cd /home/alex/MojoUI && mojo build -I . -Xlinker -L. -Xlinker -lmojoui_floor -Xlinker -lm examples/m6_nodegraph.mojo -o /tmp/mojoui_m6_nodegraph && echo BUILT /tmp/serenity_ui /tmp/mojoui_m6_nodegraph" }
+build = { cmd = "bash scripts/build_cached.sh" }
 
 # Run the windowed app. LD_LIBRARY_PATH points the loader at MojoUI's C floor.
 run = { cmd = "LD_LIBRARY_PATH=/home/alex/MojoUI /tmp/serenity_ui", depends-on = ["build"] }
