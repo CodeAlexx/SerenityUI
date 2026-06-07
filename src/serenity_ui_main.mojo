@@ -62,6 +62,7 @@ from mojoui.app.inference_graph_bridge import (
     graph_submit_current,
     graph_tick_and_apply,
 )
+from mojoui.app.nodegraph_launcher import launch_comfy_nodegraph
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +117,7 @@ struct InferenceUIState(Movable):
     var tab: Int32           # 0 = Image, 1 = Video
     var theme_dark: Bool     # dark/light toggle in the menu bar
     var open_menu: Int32     # menu-bar dropdown open index (-1 = none)
+    var menu_status: String
 
     def __init__(out self):
         self.ctx = Context()
@@ -140,6 +142,7 @@ struct InferenceUIState(Movable):
         self.tab = 0
         self.theme_dark = True
         self.open_menu = -1
+        self.menu_status = String("ready")
         _apply_serenity_palette(self.ctx, True)
 
 
@@ -708,6 +711,7 @@ def _menu_bar(mut s: InferenceUIState):
     # top-level menu labels (dropdowns wired in a later slice)
     var menus = List[String]()
     menus.append(String("File"))
+    menus.append(String("Nodes"))
     menus.append(String("Edit"))
     menus.append(String("View"))
     menus.append(String("Models"))
@@ -720,6 +724,13 @@ def _menu_bar(mut s: InferenceUIState):
         var brect = Rect(x, top + _fpx(s, 4.0), bw, h - _fpx(s, 8.0))
         var mid = ctx.get_id(String("menu_") + lbl)
         var flags = ctx.update_control(mid, brect.copy(), OPT_NONE)
+        if (flags & CTRL_RELEASED) != 0:
+            if lbl == String("Nodes"):
+                var rc = launch_comfy_nodegraph()
+                if rc == 0:
+                    s.menu_status = String("nodes graph opening")
+                else:
+                    s.menu_status = String("nodes launch failed: ") + String(rc)
         if (flags & CTRL_HOVERED) != 0:
             ctx.draw_rect(brect.copy(), ctx.theme.hover_bg.copy())
         ctx.draw_text(s.font_id, fs, Vec2(x + _fpx(s, 8.0), ty),
@@ -788,7 +799,10 @@ def _status_bar(mut s: InferenceUIState):
     ctx.draw_rect(Rect(_fpx(s, 10.0), y + (h - dot) * 0.5, dot, dot),
                   Color(90, 200, 120, 255))
     ctx.draw_text(s.font_id, fs, Vec2(_fpx(s, 24.0), ty), Color(150, 150, 165, 255),
-                  String("backend connected  ·  serenitymojo  ·  ") + graph_backend_label(s.zrt))
+                  String("backend connected  ·  serenitymojo  ·  ")
+                  + graph_backend_label(s.zrt)
+                  + String("  ·  ")
+                  + s.menu_status)
 
 
 def _draw_backgrounds(mut s: InferenceUIState):
