@@ -1198,7 +1198,7 @@ def _nodes_panel(mut s: InferenceUIState, body_h: Float32) raises:
             s.node_rename_state = TextEditState(single_line=True)
         s.menu_status = String("renaming node")
     elif act == NODE_ACTION_COLOR:
-        s.menu_status = String("cycled node color")
+        s.menu_status = String("selected node color")
         changed = True
 
     if add_menu(ctx, String("serenity_add_menu"), s.node_addmenu, s.node_registry, s.node_graph):
