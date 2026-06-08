@@ -310,6 +310,14 @@ def _populate_node_workflow_presets(mut names: List[String], mut paths: List[Str
     _add_node_workflow_preset(names, paths, String("Comfy/Swarm / Image Inpainting Qwen"), sw + String("Image Inpainting (Qwen-image).json"))
     _add_node_workflow_preset(names, paths, String("Comfy/Swarm / Prompt Enhance"), sw + String("Prompt Enhance.json"))
 
+    var lp = String("/home/alex/LanPaint/example_workflows/")
+    _add_node_workflow_preset(names, paths, String("LanPaint / Qwen Image Inpaint"), lp + String("Qwen_Image_Inpaint.json"))
+    _add_node_workflow_preset(names, paths, String("LanPaint / Qwen Image Outpaint"), lp + String("Qwen_Image_Outpaint.json"))
+    _add_node_workflow_preset(names, paths, String("LanPaint / Flux 2 Klein Inpainting"), lp + String("Flux2_Klein_inpainting.json"))
+    _add_node_workflow_preset(names, paths, String("LanPaint / Z-Image Inpaint"), lp + String("Z_image_Inpaint.json"))
+    _add_node_workflow_preset(names, paths, String("LanPaint / Wan 2.2 T2I Inpaint"), lp + String("wan2_2_T2I_Inpaint.json"))
+    _add_node_workflow_preset(names, paths, String("LanPaint / SDXL Inpaint"), lp + String("SDXL_Inpaint.json"))
+
 
 def _clamp_scale(v: Float32) -> Float32:
     if v < 1.0:
