@@ -318,6 +318,14 @@ def _populate_node_workflow_presets(mut names: List[String], mut paths: List[Str
     _add_node_workflow_preset(names, paths, String("LanPaint / Wan 2.2 T2I Inpaint"), lp + String("wan2_2_T2I_Inpaint.json"))
     _add_node_workflow_preset(names, paths, String("LanPaint / SDXL Inpaint"), lp + String("SDXL_Inpaint.json"))
 
+    var vhs = String("/home/alex/ComfyUI-VideoHelperSuite/tests/")
+    _add_node_workflow_preset(names, paths, String("VHS / Simple Video"), vhs + String("simple.json"))
+    _add_node_workflow_preset(names, paths, String("VHS / Loop Video"), vhs + String("loop.json"))
+    _add_node_workflow_preset(names, paths, String("VHS / Audio Video"), vhs + String("audio.json"))
+    _add_node_workflow_preset(names, paths, String("VHS / Batch 4x4"), vhs + String("batch4x4.json"))
+    _add_node_workflow_preset(names, paths, String("VHS / Converted Input"), vhs + String("converted-input.json"))
+    _add_node_workflow_preset(names, paths, String("VHS / Format Input"), vhs + String("converted-format-input.json"))
+
 
 def _clamp_scale(v: Float32) -> Float32:
     if v < 1.0:
