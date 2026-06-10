@@ -183,12 +183,20 @@ struct InferenceUIState(Movable):
     var presets: List[String]
     var preset_index: Int32
     var preset_open: Bool
+    var preset_was_open: Bool     # F7: detect dropdown OPEN -> rescan dir
+    var preset_page: Int          # F7: dropdown page (PRESET_PAGE entries)
     var preset_name_buf: String
     var preset_name_state: TextEditState
 
     # persistent history (P14-P16)
     var gallery: List[GalleryItem]
     var starred_ids: List[String]
+    var hist_page: Int            # F6: history rail pager
+    var queue_page: Int           # F6: queue rail pager
+    var starred_first: Bool       # F6: starred-first sort toggle
+
+    # F1: seed is a TEXT mirror (integer end-to-end) — its edit engine
+    var seed_edit: TextEditState
 
     # TEMPORARY --selftest-ui driver (scripted gates): 0=off, 1=auto-generate,
     # 2=auto-generate then auto-cancel. Drives the SAME functions the buttons
@@ -249,10 +257,17 @@ struct InferenceUIState(Movable):
         self.presets = list_presets()
         self.preset_index = 0
         self.preset_open = False
+        self.preset_was_open = False
+        self.preset_page = 0
         self.preset_name_buf = String("my-preset")
         self.preset_name_state = TextEditState(single_line=True)
-        self.starred_ids = load_stars()
+        var stars_warning = String("")
+        self.starred_ids = load_stars(stars_warning)
         self.gallery = load_gallery_from_db(self.starred_ids)
+        self.hist_page = 0
+        self.queue_page = 0
+        self.starred_first = False
+        self.seed_edit = TextEditState(single_line=True)
         self.autogen_mode = 0
         self.frame_no = 0
 
@@ -276,6 +291,8 @@ struct InferenceUIState(Movable):
         self.theme_dark = True
         self.open_menu = -1
         self.menu_status = String("ready")
+        if stars_warning.byte_length() > 0:
+            self.menu_status = stars_warning.copy()  # F9: never silently lose
         _apply_serenity_palette(self.ctx, True)
 
         # daemon health + /v1/models population (P1/P2) with CLI fallback,
@@ -564,9 +581,25 @@ def _do_load_preset(mut s: InferenceUIState):
         s.menu_status = String("no preset selected")
         return
     try:
-        var p = GenParams.from_json(load_preset(s.presets[idx]))
+        # F8: typed load — wrong-typed fields keep the CURRENT value and are
+        # reported, never silently defaulted.
+        var ignored = List[String]()
+        var p = GenParams.from_json_validated(
+            load_preset(s.presets[idx]), s.store.params, ignored
+        )
         s.store.set(p^)   # H2 dispatch; mirrors refresh next frame
-        s.menu_status = String("preset loaded: ") + s.presets[idx]
+        if len(ignored) > 0:
+            var msg = String("preset field")
+            if len(ignored) > 1:
+                msg += String("s")
+            for i in range(len(ignored)):
+                if i > 0:
+                    msg += String(",")
+                msg += String(" '") + ignored[i] + String("'")
+            s.menu_status = msg + String(" ignored (wrong type) — ") \
+                + s.presets[idx]
+        else:
+            s.menu_status = String("preset loaded: ") + s.presets[idx]
     except e:
         s.menu_status = String("preset load failed: ") + String(e)
 
@@ -638,8 +671,12 @@ def _submit_generate(mut s: InferenceUIState):
         return
     _sync_params_to_state(s, p, cli_name)
     s.zrt.route_label = String("cli")
-    s.menu_status = String("CLI: ") + cli_name
     graph_submit_current(s.model, s.zrt)
+    # F11: be honest about what the CLI request JSON drops.
+    if s.zrt.cli_active:
+        s.menu_status = String("CLI ") + cli_name + String(" — ") + s.zrt.cli_note
+    else:
+        s.menu_status = s.zrt.last_error.copy()
 
 
 def _cancel_generate(mut s: InferenceUIState):
@@ -1066,8 +1103,9 @@ def _section_model(mut s: InferenceUIState) raises:
                      s.model.task_index, s.model.task_open)
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("Model:"))
-        _ = combobox(ctx, String("model"), s.model_display,
-                     s.store.m_model_index, s.model_combo_open)
+        if combobox(ctx, String("model"), s.model_display,
+                    s.store.m_model_index, s.model_combo_open):
+            s.store.d_model = True
         ctx.layout_row(_row1(_left_full_w(s)), _px(s, 20))
         if s.models_from_daemon:
             var arch = _selected_arch(s)
@@ -1096,29 +1134,43 @@ def _section_resolution(mut s: InferenceUIState) raises:
         if button(ctx, String("1:1")):
             s.store.m_width = 1024.0
             s.store.m_height = 1024.0
+            s.store.d_width = True
+            s.store.d_height = True
         if button(ctx, String("3:2")):
             s.store.m_width = 1216.0
             s.store.m_height = 832.0
+            s.store.d_width = True
+            s.store.d_height = True
         if button(ctx, String("16:9")):
             s.store.m_width = 1344.0
             s.store.m_height = 768.0
+            s.store.d_width = True
+            s.store.d_height = True
         if button(ctx, String("9:16")):
             s.store.m_width = 768.0
             s.store.m_height = 1344.0
+            s.store.d_width = True
+            s.store.d_height = True
         ctx.layout_row(_row2(bw * 2 + _px(s, 4), bw * 2), _px(s, 26))
         if button(ctx, String("512 · 1:1")):
             s.store.m_width = 512.0
             s.store.m_height = 512.0
+            s.store.d_width = True
+            s.store.d_height = True
         if button(ctx, String("Swap W/H")):
             var t = s.store.m_width
             s.store.m_width = s.store.m_height
             s.store.m_height = t
+            s.store.d_width = True
+            s.store.d_height = True
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("Width:"))
-        _ = drag_value(ctx, s.store.m_width, String("width"), Float32(8.0))
+        if drag_value(ctx, s.store.m_width, String("width"), Float32(8.0)):
+            s.store.d_width = True
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("Height:"))
-        _ = drag_value(ctx, s.store.m_height, String("height"), Float32(8.0))
+        if drag_value(ctx, s.store.m_height, String("height"), Float32(8.0)):
+            s.store.d_height = True
         if _selected_arch(s) == String("zimage") and (
             Int(s.store.m_width) != 512 or Int(s.store.m_height) != 512
         ):
@@ -1132,18 +1184,22 @@ def _section_sampling(mut s: InferenceUIState) raises:
     if collapsing_header(ctx, String("Sampling"), s.sec_sampling):
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("Sampler:"))
-        _ = combobox(ctx, String("sampler"), s.model.sampler_options,
-                     s.store.m_sampler_index, s.model.sampler_open)
+        if combobox(ctx, String("sampler"), s.model.sampler_options,
+                    s.store.m_sampler_index, s.model.sampler_open):
+            s.store.d_sampler = True
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("Scheduler:"))
-        _ = combobox(ctx, String("scheduler"), s.model.scheduler_options,
-                     s.store.m_scheduler_index, s.model.scheduler_open)
+        if combobox(ctx, String("scheduler"), s.model.scheduler_options,
+                    s.store.m_scheduler_index, s.model.scheduler_open):
+            s.store.d_scheduler = True
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("Steps:"))
-        _ = slider(ctx, s.store.m_steps, Float32(1.0), Float32(100.0), String("steps"))
+        if slider(ctx, s.store.m_steps, Float32(1.0), Float32(100.0), String("steps")):
+            s.store.d_steps = True
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("CFG:"))
-        _ = drag_value(ctx, s.store.m_cfg, String("cfg"), Float32(0.1))
+        if drag_value(ctx, s.store.m_cfg, String("cfg"), Float32(0.1)):
+            s.store.d_cfg = True
 
 
 def _section_seed(mut s: InferenceUIState) raises:
@@ -1152,24 +1208,30 @@ def _section_seed(mut s: InferenceUIState) raises:
     if collapsing_header(ctx, String("Seed"), s.sec_seed):
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("Seed:"))
-        _ = drag_value(ctx, s.store.m_seed, String("seed"), Float32(1.0))
+        # F1: TEXT mirror — integer end-to-end (a Float32 drag corrupts
+        # seeds > 2^24, e.g. 123456789 -> 123456792)
+        if text_edit(ctx, String("seed"), s.store.m_seed_text, s.seed_edit):
+            s.store.d_seed = True
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String(""))
         if button(ctx, String("Randomize")):
             s.pseudo_rng = s.pseudo_rng * UInt32(1664525) + UInt32(1013904223)
-            s.store.m_seed = Float32(Int(s.pseudo_rng % UInt32(1000000)))
+            s.store.m_seed_text = String(Int(s.pseudo_rng % UInt32(1000000)))
+            s.store.d_seed = True
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("Var seed:"))
-        _ = drag_value(ctx, s.store.m_variation_seed, String("var_seed"), Float32(1.0))
+        if drag_value(ctx, s.store.m_variation_seed, String("var_seed"), Float32(1.0)):
+            s.store.d_variation_seed = True
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("Var strength:"))
-        _ = drag_value(
+        if drag_value(
             ctx, s.store.m_variation_strength, String("var_strength"), Float32(0.01)
-        )
-        if s.store.m_variation_strength < 0.0:
-            s.store.m_variation_strength = 0.0
-        if s.store.m_variation_strength > 1.0:
-            s.store.m_variation_strength = 1.0
+        ):
+            s.store.d_variation_strength = True
+            if s.store.m_variation_strength < 0.0:
+                s.store.m_variation_strength = 0.0
+            if s.store.m_variation_strength > 1.0:
+                s.store.m_variation_strength = 1.0
 
 
 def _section_lora(mut s: InferenceUIState) raises:
@@ -1184,11 +1246,13 @@ def _section_lora(mut s: InferenceUIState) raises:
                 _row3(_px(s, 168), _px(s, 142), _px(s, 30)), _px(s, 26)
             )
             var open_flag = s.lora_row_open[i]
-            _ = combobox(ctx, String("lora_sel_") + String(i), s.lora_names,
-                         s.store.m_lora_indices[i], open_flag)
+            if combobox(ctx, String("lora_sel_") + String(i), s.lora_names,
+                        s.store.m_lora_indices[i], open_flag):
+                s.store.d_loras = True
             s.lora_row_open[i] = open_flag
-            _ = slider(ctx, s.store.m_lora_weights[i], Float32(0.0),
-                       Float32(2.0), String("lora_w_") + String(i))
+            if slider(ctx, s.store.m_lora_weights[i], Float32(0.0),
+                      Float32(2.0), String("lora_w_") + String(i)):
+                s.store.d_loras = True
             # NOTE: button ids hash the label — keep per-row labels unique
             if button(ctx, String("x") + String(i + 1)):
                 remove_at = i
@@ -1205,12 +1269,14 @@ def _section_lora(mut s: InferenceUIState) raises:
             s.store.m_lora_indices = keep_idx^
             s.store.m_lora_weights = keep_w^
             s.lora_row_open = keep_open^
+            s.store.d_loras = True
         ctx.layout_row(_row1(_px(s, 180)), _px(s, 28))
         if button(ctx, String("+ Add LoRA")):
             if len(s.lora_names) > 0:
                 s.store.m_lora_indices.append(Int32(0))
                 s.store.m_lora_weights.append(Float32(1.0))
                 s.lora_row_open.append(False)
+                s.store.d_loras = True
 
 
 def _section_batch(mut s: InferenceUIState) raises:
@@ -1219,19 +1285,75 @@ def _section_batch(mut s: InferenceUIState) raises:
     if collapsing_header(ctx, String("Images"), s.sec_batch):
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("Count: ") + String(Int(s.store.m_images)))
-        _ = slider(ctx, s.store.m_images, Float32(1.0), Float32(8.0), String("images"))
+        if slider(ctx, s.store.m_images, Float32(1.0), Float32(8.0), String("images")):
+            s.store.d_images = True
+
+
+comptime PRESET_PAGE = 10  # F7: dropdown rows per page (50 entries overflow)
+
+
+def _preset_page_count(s: InferenceUIState) -> Int:
+    var n = len(s.presets)
+    if n == 0:
+        return 1
+    return (n + PRESET_PAGE - 1) // PRESET_PAGE
 
 
 def _section_presets(mut s: InferenceUIState) raises:
-    """P8: named param presets (JSON files under ~/.serenity/ui_presets/)."""
+    """P8: named param presets (JSON files under ~/.serenity/ui_presets/).
+    F7: the dropdown is PAGED (PRESET_PAGE rows/page) so 50+ presets stay
+    reachable, and the preset dir is rescanned every time the dropdown
+    OPENs."""
     ref ctx = s.ctx
     if collapsing_header(ctx, String("Presets"), s.sec_presets):
+        var pages = _preset_page_count(s)
+        if s.preset_page >= pages:
+            s.preset_page = pages - 1
+        if s.preset_page < 0:
+            s.preset_page = 0
+        var lo = s.preset_page * PRESET_PAGE
+        var hi = lo + PRESET_PAGE
+        if hi > len(s.presets):
+            hi = len(s.presets)
+        var page_opts = List[String]()
+        for i in range(lo, hi):
+            page_opts.append(s.presets[i].copy())
+        var local_sel = Int32(-1)
+        if Int(s.preset_index) >= lo and Int(s.preset_index) < hi:
+            local_sel = s.preset_index - Int32(lo)
+
         var bw = _px(s, 80)
         ctx.layout_row(_row2(_left_full_w(s) - bw - _px(s, 4), bw), _px(s, 28))
-        _ = combobox(ctx, String("preset_sel"), s.presets,
-                     s.preset_index, s.preset_open)
+        if combobox(ctx, String("preset_sel"), page_opts,
+                    local_sel, s.preset_open):
+            s.preset_index = Int32(lo) + local_sel
+        if s.preset_open and not s.preset_was_open:
+            # F7: dropdown just OPENed -> rescan the preset dir (keep the
+            # current selection by name when it survives the rescan)
+            var sel_name = String("")
+            if Int(s.preset_index) >= 0 and Int(s.preset_index) < len(s.presets):
+                sel_name = s.presets[Int(s.preset_index)].copy()
+            s.presets = list_presets()
+            for i in range(len(s.presets)):
+                if s.presets[i] == sel_name:
+                    s.preset_index = Int32(i)
+        s.preset_was_open = s.preset_open
         if button(ctx, String("Load")):
             _do_load_preset(s)
+        # pager row (F7)
+        var pw = _px(s, 60)
+        ctx.layout_row(
+            _row3(pw, _left_full_w(s) - pw * 2 - _px(s, 8), pw), _px(s, 24)
+        )
+        if button(ctx, String("< pg")):
+            if s.preset_page > 0:
+                s.preset_page -= 1
+        label(ctx, String("page ") + String(s.preset_page + 1) + String("/")
+              + String(pages) + String(" · ") + String(len(s.presets))
+              + String(" presets"))
+        if button(ctx, String("pg >")):
+            if s.preset_page + 1 < pages:
+                s.preset_page += 1
         ctx.layout_row(_row2(_left_full_w(s) - bw - _px(s, 4), bw), _px(s, 28))
         _ = text_edit(ctx, String("preset_name"), s.preset_name_buf,
                       s.preset_name_state)
@@ -1301,13 +1423,13 @@ def _center_panel(mut s: InferenceUIState, col_x: Float32) raises:
     label(ctx, String("Prompt:"))
     ctx.layout_row(_row1(_center_w(s)), _px(s, 80))
     if text_area(ctx, String("prompt"), s.store.m_prompt, s.prompt_edit):
-        pass
+        s.store.d_prompt = True
 
     ctx.layout_row(_row1(_center_w(s)), _px(s, 24))
     label(ctx, String("Negative:"))
     ctx.layout_row(_row1(_center_w(s)), _px(s, 56))
     if text_area(ctx, String("negative"), s.store.m_negative, s.negative_edit):
-        pass
+        s.store.d_negative = True
 
     # action bar
     ctx.layout_row(_row3(_px(s, 196), _px(s, 200), _px(s, 200)), _px(s, 40))
@@ -1320,7 +1442,8 @@ def _center_panel(mut s: InferenceUIState, col_x: Float32) raises:
             _submit_generate(s)
     if button(ctx, String("Randomize seed")):
         s.pseudo_rng = s.pseudo_rng * UInt32(1664525) + UInt32(1013904223)
-        s.store.m_seed = Float32(Int(s.pseudo_rng % UInt32(1000000)))
+        s.store.m_seed_text = String(Int(s.pseudo_rng % UInt32(1000000)))
+        s.store.d_seed = True
 
     # image preview
     ctx.layout_row(_row1(_center_w(s)), _px(s, 460))
@@ -1348,6 +1471,10 @@ def _center_panel(mut s: InferenceUIState, col_x: Float32) raises:
                       Color(150, 200, 160, 255), readout)
 
 
+comptime _QUEUE_PAGE = 10   # F6: queue rows per page
+comptime _HIST_PAGE = 12    # F6: history rows per page
+
+
 def _right_panel(mut s: InferenceUIState, col_x: Float32) raises:
     ref ctx = s.ctx
     # queue / history tab buttons
@@ -1360,36 +1487,73 @@ def _right_panel(mut s: InferenceUIState, col_x: Float32) raises:
     separator(ctx)
 
     if s.model.queue_tab == 0:
-        # P12: the queue rail renders the daemon's /v1/jobs directly
+        # P12: the queue rail renders the daemon's /v1/jobs directly.
+        # F6: paged over the FULL list ([newer]/[older]); F9: ASCII marks;
+        # F10: per-job [x] cancel for queued/running rows.
         var jobs = s.zrt.daemon_jobs_cache.copy()
         var nj = len(jobs)
         if s.zrt.daemon_ok and nj > 0:
-            var shown = 0
-            for i in range(nj):
-                var idx = nj - 1 - i  # newest first
-                if shown >= 12:
+            var qpages = (nj + _QUEUE_PAGE - 1) // _QUEUE_PAGE
+            if s.queue_page >= qpages:
+                s.queue_page = qpages - 1
+            if s.queue_page < 0:
+                s.queue_page = 0
+            var start = s.queue_page * _QUEUE_PAGE
+            var cancel_id = String("")
+            for k in range(_QUEUE_PAGE):
+                var i = start + k
+                if i >= nj:
                     break
-                shown += 1
-                ctx.layout_row(_row1(_right_w(s)), _px(s, 22))
-                var mark = String("· ")
+                var idx = nj - 1 - i  # newest first
+                var mark = String("- ")
                 if jobs[idx].state == String("running"):
-                    mark = String("▶ ")
+                    mark = String("> ")
                 elif jobs[idx].state == String("done"):
-                    mark = String("✓ ")
+                    mark = String("ok ")
+                var terminal = jobs[idx].is_terminal()
+                if terminal:
+                    ctx.layout_row(_row1(_right_w(s)), _px(s, 22))
+                else:
+                    ctx.layout_row(
+                        _row2(_right_w(s) - _px(s, 38), _px(s, 30)), _px(s, 22)
+                    )
                 label(ctx, mark + jobs[idx].id + String("  ")
                       + jobs[idx].state + String("  ")
                       + String(jobs[idx].step) + String("/")
                       + String(jobs[idx].total))
+                if not terminal:
+                    # F10: per-job cancel -> POST /v1/cancel/<id>
+                    if button(ctx, String("x ") + jobs[idx].id):
+                        cancel_id = jobs[idx].id.copy()
                 if jobs[idx].state == String("running"):
                     ctx.layout_row(_row1(_right_w(s)), _px(s, 14))
                     var frac = Float32(0.0)
                     if jobs[idx].total > 0:
                         frac = Float32(jobs[idx].step) / Float32(jobs[idx].total)
                     progress_bar(ctx, frac)
+            if cancel_id.byte_length() > 0:
+                try:
+                    _ = daemon_cancel(cancel_id)
+                    s.menu_status = String("cancel requested: ") + cancel_id
+                except e:
+                    s.menu_status = String("cancel failed: ") + String(e)
+            # pager (F6)
+            ctx.layout_row(
+                _row3(_px(s, 90), _px(s, 150), _px(s, 90)), _px(s, 24)
+            )
+            if button(ctx, String("newer")):
+                if s.queue_page > 0:
+                    s.queue_page -= 1
+            label(ctx, String("page ") + String(s.queue_page + 1)
+                  + String("/") + String(qpages) + String(" · ")
+                  + String(nj) + String(" jobs"))
+            if button(ctx, String("older")):
+                if s.queue_page + 1 < qpages:
+                    s.queue_page += 1
         elif s.model.has_running:
             # CLI fallback path: the in-memory mirror
             ctx.layout_row(_row1(_right_w(s)), _px(s, 22))
-            label(ctx, String("▶ running #") + String(s.model.running.id))
+            label(ctx, String("> running #") + String(s.model.running.id))
             ctx.layout_row(_row1(_right_w(s)), _px(s, 16))
             progress_bar(ctx, s.model.running.progress())
         else:
@@ -1399,27 +1563,67 @@ def _right_panel(mut s: InferenceUIState, col_x: Float32) raises:
                 msg = String("(queue empty · daemon down)")
             label(ctx, msg)
     else:
-        # P14-P16: persistent history (jobs.db + session) with star + reuse
+        # P14-P16: persistent history (jobs.db + session) with star + reuse.
+        # F6: paged over the FULL gallery + a starred-first toggle.
         var nh = len(s.gallery)
         if nh == 0:
             ctx.layout_row(_row1(_right_w(s)), _px(s, 22))
             label(ctx, String("(no history)"))
-        var shown = 0
+        # display order: newest first; starred first when toggled (F6)
+        var order = List[Int]()
+        if s.starred_first:
+            for i in range(nh):
+                var idx = nh - 1 - i
+                if s.gallery[idx].starred:
+                    order.append(idx)
+            for i in range(nh):
+                var idx = nh - 1 - i
+                if not s.gallery[idx].starred:
+                    order.append(idx)
+        else:
+            for i in range(nh):
+                order.append(nh - 1 - i)
+        var hpages = (nh + _HIST_PAGE - 1) // _HIST_PAGE
+        if hpages < 1:
+            hpages = 1
+        if s.hist_page >= hpages:
+            s.hist_page = hpages - 1
+        if s.hist_page < 0:
+            s.hist_page = 0
+        # starred-first toggle (F6) — ASCII only (F9)
+        ctx.layout_row(_row1(_px(s, 200)), _px(s, 24))
+        var tog = String("[*] starred first: on") if s.starred_first \
+            else String("[ ] starred first: off")
+        if button(ctx, tog):
+            s.starred_first = not s.starred_first
+            s.hist_page = 0
         var star_clicked = -1
         var reuse_clicked = -1
-        for i in range(nh):
-            var idx = nh - 1 - i  # newest first
-            if shown >= 14:
+        var hstart = s.hist_page * _HIST_PAGE
+        for k in range(_HIST_PAGE):
+            var oi = hstart + k
+            if oi >= len(order):
                 break
-            shown += 1
-            ctx.layout_row(_row2(_px(s, 34), _px(s, 290)), _px(s, 24))
-            var star_lbl = String("★ ") if s.gallery[idx].starred else String("☆ ")
+            var idx = order[oi]
+            ctx.layout_row(_row2(_px(s, 40), _px(s, 284)), _px(s, 24))
+            # F9: ASCII star (the UI font has no ★ glyph)
+            var star_lbl = String("[*]") if s.gallery[idx].starred else String("[ ]")
             # unique per-row labels (button ids hash the label)
-            if button(ctx, star_lbl + String(idx)):
+            if button(ctx, star_lbl + String(" ") + String(idx)):
                 star_clicked = idx
             if button(ctx, s.gallery[idx].job_id + String(" · ")
                       + s.gallery[idx].model):
                 reuse_clicked = idx
+        # pager (F6)
+        ctx.layout_row(_row3(_px(s, 90), _px(s, 150), _px(s, 90)), _px(s, 24))
+        if button(ctx, String("newer ")):
+            if s.hist_page > 0:
+                s.hist_page -= 1
+        label(ctx, String("page ") + String(s.hist_page + 1) + String("/")
+              + String(hpages) + String(" · ") + String(nh) + String(" items"))
+        if button(ctx, String("older ")):
+            if s.hist_page + 1 < hpages:
+                s.hist_page += 1
         if star_clicked >= 0:
             _toggle_star(s, star_clicked)
         if reuse_clicked >= 0:
@@ -1583,10 +1787,19 @@ def _status_bar(mut s: InferenceUIState):
     var fs = _font_body(s)
     var ty = y + (h + Float32(fs) * 0.7) * 0.5
     var dot = _fpx(s, 7.0)
+    # F5: the dot reflects ACTUAL health (dedicated ~2 s probe): green ok /
+    # red down / yellow degraded (up but recent probe/poll failures).
+    var dot_color = Color(220, 70, 70, 255)        # red: down
+    var daemon_lbl = String("daemon DOWN -> CLI")
+    if s.zrt.daemon_ok:
+        if s.zrt.health_fail_streak > 0 or s.zrt.daemon_fail_streak > 0:
+            dot_color = Color(225, 190, 60, 255)   # yellow: degraded
+            daemon_lbl = String("daemon degraded (") + s.zrt.daemon_backend + String(")")
+        else:
+            dot_color = Color(90, 200, 120, 255)   # green: healthy
+            daemon_lbl = String("daemon ok (") + s.zrt.daemon_backend + String(")")
     ctx.draw_rect(Rect(_fpx(s, 10.0), y + (h - dot) * 0.5, dot, dot),
-                  Color(90, 200, 120, 255))
-    var daemon_lbl = String("daemon ok (") + s.zrt.daemon_backend + String(")") \
-        if s.zrt.daemon_ok else String("daemon down → CLI")
+                  dot_color^)
     ctx.draw_text(s.font_id, fs, Vec2(_fpx(s, 24.0), ty), Color(150, 150, 165, 255),
                   daemon_lbl
                   + String("  ·  ")
@@ -1850,6 +2063,9 @@ def _frame() -> None:
     # textures are current this frame.
     graph_tick_and_apply(sp[].model, sp[].zrt)
     _drain_daemon_done(sp[])
+    # F3: a lost/finished run must not leave a stale "generating" status
+    if not sp[].model.generating and sp[].menu_status == String("daemon: generating"):
+        sp[].menu_status = sp[].zrt.last_status.copy()
     # H2 subscriber re-read: external store.set() (preset load / reuse-params)
     # lands in the widget mirrors before the widgets draw.
     _refresh_store(sp[])
@@ -1882,14 +2098,21 @@ def _frame() -> None:
             sp[].preset_name_buf = String("uigate-roundtrip")
             _do_save_preset(sp[])
         elif sp[].frame_no == 250:
-            # scramble through the widget mirrors (what user edits do)
+            # scramble through the widget mirrors + dirty flags (the exact
+            # state a user edit leaves behind — see F2 dirty-commit)
             sp[].store.m_prompt = String("scrambled: totally different prompt")
             sp[].prompt_edit.set_text(sp[].store.m_prompt)
+            sp[].store.d_prompt = True
             sp[].store.m_steps = 77.0
+            sp[].store.d_steps = True
             sp[].store.m_cfg = 9.9
-            sp[].store.m_seed = 1.0
+            sp[].store.d_cfg = True
+            sp[].store.m_seed_text = String("1")
+            sp[].store.d_seed = True
             sp[].store.m_width = 1344.0
+            sp[].store.d_width = True
             sp[].store.m_height = 768.0
+            sp[].store.d_height = True
         elif sp[].frame_no == 1500:
             for i in range(len(sp[].presets)):
                 if sp[].presets[i] == String("uigate-roundtrip"):
@@ -2070,6 +2293,161 @@ def _selftest_preset() raises:
     print("[selftest] PASS preset round-trip:", name)
 
 
+def _diff_genparams(a: GenParams, b: GenParams) -> List[String]:
+    """Full field diff (printed by the mirrors gate)."""
+    var d = List[String]()
+    if a.model != b.model:
+        d.append(String("model: '") + a.model + String("' vs '") + b.model + String("'"))
+    if a.prompt != b.prompt:
+        d.append(String("prompt: '") + a.prompt + String("' vs '") + b.prompt + String("'"))
+    if a.negative != b.negative:
+        d.append(String("negative: '") + a.negative + String("' vs '") + b.negative + String("'"))
+    if a.width != b.width:
+        d.append(String("width: ") + String(a.width) + String(" vs ") + String(b.width))
+    if a.height != b.height:
+        d.append(String("height: ") + String(a.height) + String(" vs ") + String(b.height))
+    if a.steps != b.steps:
+        d.append(String("steps: ") + String(a.steps) + String(" vs ") + String(b.steps))
+    if a.seed != b.seed:
+        d.append(String("seed: ") + String(a.seed) + String(" vs ") + String(b.seed))
+    if a.cfg != b.cfg:
+        d.append(String("cfg: ") + String(a.cfg) + String(" vs ") + String(b.cfg))
+    if a.sampler != b.sampler:
+        d.append(String("sampler: '") + a.sampler + String("' vs '") + b.sampler + String("'"))
+    if a.scheduler != b.scheduler:
+        d.append(String("scheduler: '") + a.scheduler + String("' vs '") + b.scheduler + String("'"))
+    if a.variation_seed != b.variation_seed:
+        d.append(String("variation_seed: ") + String(a.variation_seed)
+                 + String(" vs ") + String(b.variation_seed))
+    if a.variation_strength != b.variation_strength:
+        d.append(String("variation_strength: ") + String(a.variation_strength)
+                 + String(" vs ") + String(b.variation_strength))
+    if a.images != b.images:
+        d.append(String("images: ") + String(a.images) + String(" vs ") + String(b.images))
+    if len(a.loras) != len(b.loras):
+        d.append(String("loras: ") + String(len(a.loras)) + String(" vs ")
+                 + String(len(b.loras)) + String(" rows"))
+    else:
+        for i in range(len(a.loras)):
+            if a.loras[i].name != b.loras[i].name or a.loras[i].weight != b.loras[i].weight:
+                d.append(String("lora[") + String(i) + String("]: ")
+                         + a.loras[i].name + String(":") + String(a.loras[i].weight)
+                         + String(" vs ") + b.loras[i].name + String(":")
+                         + String(b.loras[i].weight))
+    return d^
+
+
+def _selftest_mirrors() raises:
+    """F1/F2 gate (--selftest-mirrors): drive the WIDGET-COMMIT path —
+    mirror fields + dirty flags exactly as the widget handlers leave them,
+    then the real _commit_store/_submit_generate — NOT store.set(). The
+    submitted JSON must carry the exact edited values; reuse-params from the
+    produced PNG and a resubmit must be byte-identical."""
+    print("[selftest-mirrors] === widget-mirror commit gate (F1/F2) ===")
+    var s = InferenceUIState()
+    if not s.zrt.daemon_ok:
+        raise Error("selftest-mirrors: daemon not running on 127.0.0.1:7801")
+    while len(s.lora_names) < 2:
+        s.lora_names.append(String("synthetic-lora-") + String(len(s.lora_names)))
+
+    # ── simulate widget edits: mirror + dirty flag (the exact state the
+    # widget handlers leave; _commit_store is the code path under test) ──
+    s.store.m_prompt = String("mirror-gate: copper kettle on a stone sill")
+    s.store.d_prompt = True
+    s.store.m_steps = 6.0
+    s.store.d_steps = True
+    s.store.m_cfg = 3.7                       # Float32 widget mirror
+    s.store.d_cfg = True
+    s.store.m_seed_text = String("123456789")  # F1: > 2^24, Float32-fatal
+    s.store.d_seed = True
+    s.store.m_variation_seed = 777.0
+    s.store.d_variation_seed = True
+    s.store.m_variation_strength = 0.66
+    s.store.d_variation_strength = True
+    s.store.m_lora_indices = List[Int32]()
+    s.store.m_lora_indices.append(Int32(0))
+    s.store.m_lora_indices.append(Int32(1))
+    s.store.m_lora_weights = List[Float32]()
+    s.store.m_lora_weights.append(Float32(0.13))
+    s.store.m_lora_weights.append(Float32(1.97))
+    s.store.d_loras = True
+    _commit_store(s)   # end-of-frame commit (the H2 dispatch)
+    _refresh_store(s)  # next frame's subscriber re-read
+
+    _submit_generate(s)
+    if len(s.zrt.daemon_submitted) == 0:
+        raise Error("selftest-mirrors: submit did not reach the daemon: " + s.menu_status)
+    var first_json = s.zrt.last_submit_json.copy()
+    print("[selftest-mirrors] submit #1:", first_json)
+    var sent = GenParams.from_json(first_json)
+    var fails = List[String]()
+    if sent.seed != 123456789:
+        fails.append(String("seed=") + String(sent.seed) + String(" want 123456789"))
+    if sent.cfg != 3.7:
+        fails.append(String("cfg=") + String(sent.cfg) + String(" want 3.7"))
+    if sent.variation_seed != 777:
+        fails.append(String("variation_seed=") + String(sent.variation_seed)
+                     + String(" want 777"))
+    if sent.variation_strength != 0.66:
+        fails.append(String("variation_strength=") + String(sent.variation_strength)
+                     + String(" want 0.66"))
+    if sent.steps != 6:
+        fails.append(String("steps=") + String(sent.steps) + String(" want 6"))
+    if len(sent.loras) != 2:
+        fails.append(String("loras rows=") + String(len(sent.loras)) + String(" want 2"))
+    else:
+        if sent.loras[0].weight != 0.13:
+            fails.append(String("lora[0].weight=") + String(sent.loras[0].weight)
+                         + String(" want 0.13"))
+        if sent.loras[1].weight != 1.97:
+            fails.append(String("lora[1].weight=") + String(sent.loras[1].weight)
+                         + String(" want 1.97"))
+    if len(fails) > 0:
+        for i in range(len(fails)):
+            print("[selftest-mirrors] FAIL", fails[i])
+        raise Error("selftest-mirrors: submitted JSON corrupted widget values")
+    print("[selftest-mirrors] PASS exact widget values in submitted JSON")
+
+    var job_id = s.zrt.daemon_submitted[0].copy()
+    var job = _selftest_wait_terminal(job_id, 1200)
+    if job.state != String("done"):
+        raise Error("selftest-mirrors: job ended " + job.state + " err=" + job.error)
+    var out = absolutize_output_path(job.output_path)
+    print("[selftest-mirrors] output:", out)
+
+    # ── reuse-params from the produced PNG (what a history click does) ──
+    var png_json = read_genparams_from_png(out)
+    var p2 = GenParams.from_json(png_json)
+    s.store.set(p2^)
+    _refresh_store(s)                  # mirrors rebuilt; dirty cleared
+    var v_before = s.store.version
+    _commit_store(s)                   # frame-end commit MUST be a no-op
+    if s.store.version != v_before:
+        raise Error(
+            "selftest-mirrors: frame-end commit re-committed refreshed "
+            "mirrors (version bumped) — the F2 corruption path"
+        )
+    print("[selftest-mirrors] PASS no re-commit after refresh (dirty-flag fix)")
+
+    _submit_generate(s)
+    var second_json = s.zrt.last_submit_json.copy()
+    print("[selftest-mirrors] submit #2:", second_json)
+    var got = GenParams.from_json(second_json)
+    var diff = _diff_genparams(sent, got)
+    if len(diff) > 0:
+        for i in range(len(diff)):
+            print("[selftest-mirrors] DIFF", diff[i])
+        raise Error("selftest-mirrors: resubmit after PNG reuse-params differs")
+    print("[selftest-mirrors] field diff: (none — all 14 fields identical)")
+    if second_json != first_json:
+        print("[selftest-mirrors] WARN: JSON strings differ (field values equal):")
+        print("  #1:", first_json)
+        print("  #2:", second_json)
+        raise Error("selftest-mirrors: resubmit JSON not byte-identical")
+    print("[selftest-mirrors] PASS resubmit byte-identical after reuse-params")
+    print("[selftest-mirrors] ALL PASS")
+
+
 def _graph_seam_selfcheck():
     """Compile and dry-run the Klein graph once at startup."""
     var state = InferenceState()
@@ -2093,8 +2471,12 @@ def main() raises:
             or a == String("--selftest-ui-reuse")
             or a == String("--selftest-ui-preset")
             or a == String("--selftest-ui-gpu")
+            or a == String("--selftest-mirrors")
         ):
             run_mode = a^
+    if run_mode == String("--selftest-mirrors"):
+        _selftest_mirrors()
+        return
     if run_mode == String("--selftest"):
         _selftest_daemon_e2e()
         _selftest_cancel()
