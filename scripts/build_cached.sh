@@ -15,14 +15,19 @@ needs_rebuild() {
 if needs_rebuild "$app_bin" \
     src \
     /home/alex/MojoUI/mojoui \
+    /home/alex/MOJO-libs/http /home/alex/MOJO-libs/json \
+    /home/alex/MOJO-libs/sqlite /home/alex/MOJO-libs/image \
     /home/alex/mojodiffusion/serenitymojo; then
     mojo build \
         -I . \
         -I /home/alex/MojoUI \
         -I /home/alex/mojodiffusion \
+        -I /home/alex/MOJO-libs \
         -Xlinker -L/home/alex/MojoUI \
         -Xlinker -lmojoui_floor \
         -Xlinker -lm \
+        -Xlinker -lssl \
+        -Xlinker -lcrypto \
         src/serenity_ui_main.mojo \
         -o "${app_bin}.next"
     mv "${app_bin}.next" "$app_bin"

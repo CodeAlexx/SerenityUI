@@ -25,6 +25,8 @@ keep-alive print prevents ASAP-destruction from freeing state early.
 
 from std.io.file import open
 from std.memory import UnsafePointer
+from std.sys import argv
+from std.time import sleep
 from mojoui.core.types import Vec2, Rect, Color
 from mojoui.core.context import Context
 from mojoui.core.control import CTRL_HOVERED, CTRL_RELEASED, OPT_NONE
@@ -61,6 +63,9 @@ from mojoui.app.inference_model import (
 from mojoui.app.inference_graph_bridge import (
     GraphUiRuntime,
     build_klein9b_inference_graph,
+    daemon_cancel_submitted,
+    daemon_refresh_health,
+    daemon_submit_params,
     dry_run_klein9b_graph,
     graph_has_port_metadata,
     graph_backend_label,
@@ -71,6 +76,27 @@ from mojoui.app.inference_graph_bridge import (
     merge_saved_node_layout,
     _sys_system,
     _write_text_file,
+)
+from mojoui.app.genparams import GenLora, GenParams, GenParamStore
+from mojoui.app.daemon_client import (
+    DaemonJobInfo,
+    DaemonLoraEntry,
+    DaemonModelEntry,
+    daemon_cancel,
+    daemon_jobs,
+    daemon_models,
+)
+from mojoui.app.gen_history import (
+    GalleryItem,
+    absolutize_output_path,
+    list_presets,
+    load_gallery_from_db,
+    load_preset,
+    load_stars,
+    read_genparams_from_png,
+    sanitize_preset_name,
+    save_preset,
+    save_stars,
 )
 from mojoui.nodes.node import FieldValue
 from mojoui.nodes.graph import Graph
@@ -140,6 +166,36 @@ struct InferenceUIState(Movable):
     var prompt_edit: MultiLineState
     var negative_edit: MultiLineState
 
+    # ── gen-screen param state (plan H1/H2) ──
+    # `store` is the SINGLE source of truth for generation params; every edit
+    # flows through store.set() (the observer dispatch point). The lists below
+    # are option catalogs (NOT param state): the daemon's /v1/models scan.
+    var store: GenParamStore
+    var model_display: List[String]   # combobox labels "arch · name"
+    var model_names: List[String]     # canonical genparams.model values
+    var model_archs: List[String]
+    var model_combo_open: Bool
+    var lora_names: List[String]      # /v1/models loras (P2 row options)
+    var lora_row_open: List[Bool]     # per-row combobox open flag
+    var models_from_daemon: Bool
+
+    # presets (P8)
+    var presets: List[String]
+    var preset_index: Int32
+    var preset_open: Bool
+    var preset_name_buf: String
+    var preset_name_state: TextEditState
+
+    # persistent history (P14-P16)
+    var gallery: List[GalleryItem]
+    var starred_ids: List[String]
+
+    # TEMPORARY --selftest-ui driver (scripted gates): 0=off, 1=auto-generate,
+    # 2=auto-generate then auto-cancel. Drives the SAME functions the buttons
+    # call. Fine to keep; remove when xdotool-driven gates land.
+    var autogen_mode: Int
+    var frame_no: Int
+
     # collapsing-header open flags (left panel)
     var sec_model: Bool
     var sec_resolution: Bool
@@ -147,6 +203,7 @@ struct InferenceUIState(Movable):
     var sec_seed: Bool
     var sec_lora: Bool
     var sec_batch: Bool
+    var sec_presets: Bool
     var sec_advanced: Bool
 
     var pseudo_rng: UInt32   # for the randomize-seed button
@@ -180,16 +237,34 @@ struct InferenceUIState(Movable):
         _populate_node_workflow_presets(self.node_workflow_options, self.node_workflow_paths)
         self.node_workflow_index = 0
         self.node_workflow_open = False
+        # ── gen-screen param store (H1) + option catalogs ──
+        self.store = GenParamStore()
+        self.model_display = List[String]()
+        self.model_names = List[String]()
+        self.model_archs = List[String]()
+        self.model_combo_open = False
+        self.lora_names = List[String]()
+        self.lora_row_open = List[Bool]()
+        self.models_from_daemon = False
+        self.presets = list_presets()
+        self.preset_index = 0
+        self.preset_open = False
+        self.preset_name_buf = String("my-preset")
+        self.preset_name_state = TextEditState(single_line=True)
+        self.starred_ids = load_stars()
+        self.gallery = load_gallery_from_db(self.starred_ids)
+        self.autogen_mode = 0
+        self.frame_no = 0
+
         self.prompt_edit = MultiLineState()
-        self.prompt_edit.set_text(self.model.prompt)
         self.negative_edit = MultiLineState()
-        self.negative_edit.set_text(self.model.negative)
         self.sec_model = True
         self.sec_resolution = True
         self.sec_sampling = True
-        self.sec_seed = False
-        self.sec_lora = False
-        self.sec_batch = False
+        self.sec_seed = True
+        self.sec_lora = True
+        self.sec_batch = True
+        self.sec_presets = True
         self.sec_advanced = False
         self.pseudo_rng = 0x9E3779B9
         self.font_id = 0
@@ -202,6 +277,15 @@ struct InferenceUIState(Movable):
         self.open_menu = -1
         self.menu_status = String("ready")
         _apply_serenity_palette(self.ctx, True)
+
+        # daemon health + /v1/models population (P1/P2) with CLI fallback,
+        # then seed the param store. (Runs LAST: self must be fully
+        # initialized before it is passed to helper functions.)
+        daemon_refresh_health(self.zrt)
+        _populate_model_catalog(self)
+        _seed_initial_params(self)
+        self.prompt_edit.set_text(self.store.m_prompt)
+        self.negative_edit.set_text(self.store.m_negative)
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +312,341 @@ def _row3(a: Int32, b: Int32, c: Int32) -> List[Int32]:
     w.append(b)
     w.append(c)
     return w^
+
+
+def _row4(a: Int32, b: Int32, c: Int32, d: Int32) -> List[Int32]:
+    var w = List[Int32]()
+    w.append(a)
+    w.append(b)
+    w.append(c)
+    w.append(d)
+    return w^
+
+
+# ---------------------------------------------------------------------------
+# Gen-screen param plumbing (plan H1/H2 + P1-P6/P8/P11/P12/P14-P16).
+# ---------------------------------------------------------------------------
+
+
+def _populate_model_catalog(mut s: InferenceUIState):
+    """P1: model selector backed by the daemon's /v1/models disk scan
+    (grouped by arch in the labels); P2: LoRA options from the same scan.
+    Daemon down -> static CLI-name fallback (arch 'cli')."""
+    s.model_display = List[String]()
+    s.model_names = List[String]()
+    s.model_archs = List[String]()
+    s.lora_names = List[String]()
+    s.models_from_daemon = False
+    if s.zrt.daemon_ok:
+        try:
+            var models = List[DaemonModelEntry]()
+            var loras = List[DaemonLoraEntry]()
+            daemon_models(models, loras)
+            # group by arch: stable sort by arch label (zimage first since it
+            # is the daemon-routable family)
+            var order: List[String] = [
+                "zimage", "flux-2/klein", "flux", "chroma", "qwen-image",
+                "sd3", "sdxl", "anima", "ltx2", "wan", "unknown",
+            ]
+            for g in range(len(order)):
+                for i in range(len(models)):
+                    if models[i].arch != order[g]:
+                        continue
+                    s.model_display.append(
+                        models[i].arch + String(" · ") + models[i].name
+                    )
+                    s.model_names.append(models[i].name.copy())
+                    s.model_archs.append(models[i].arch.copy())
+            for i in range(len(loras)):
+                s.lora_names.append(loras[i].name.copy())
+            s.models_from_daemon = True
+        except e:
+            print("[gen-screen] /v1/models failed:", String(e))
+    if len(s.model_names) == 0:
+        # static CLI fallback (daemon down): names double as backend names
+        var fallback: List[String] = [
+            "Z-Image (base)", "Z-Image (turbo)", "Klein 9B", "Klein 4B",
+            "Qwen-Image", "FLUX Dev", "Chroma", "SD 3.5", "ERNIE", "Anima",
+            "SDXL",
+        ]
+        for i in range(len(fallback)):
+            s.model_display.append(String("cli · ") + fallback[i])
+            s.model_names.append(fallback[i].copy())
+            s.model_archs.append(String("cli"))
+        # demo LoRA names so the stack is editable offline
+        s.lora_names = ["detail-tweaker-xl", "film-photography-v2"]
+
+
+def _seed_initial_params(mut s: InferenceUIState):
+    """Initial canonical params through the H2 dispatch point."""
+    var p = GenParams()
+    p.prompt = String(
+        "cinematic portrait, 85mm, warm afternoon light, film grain"
+    )
+    p.negative = String("ugly, blurry, low quality, watermark")
+    p.width = 512
+    p.height = 512
+    p.steps = 20
+    p.cfg = 4.5
+    p.seed = 42
+    p.images = 1
+    # prefer the daemon-routable zimage_base checkpoint when present
+    var pick = 0
+    for i in range(len(s.model_names)):
+        if s.model_archs[i] == String("zimage"):
+            pick = i
+            break
+    if pick < len(s.model_names):
+        p.model = s.model_names[pick].copy()
+    if len(s.model.sampler_options) > 0:
+        p.sampler = s.model.sampler_options[0].copy()
+    if len(s.model.scheduler_options) > 0:
+        p.scheduler = s.model.scheduler_options[0].copy()
+    try:
+        s.store.set(p^)
+    except e:
+        print("[gen-screen] initial store.set failed:", String(e))
+    _refresh_store(s)
+
+
+def _cli_name_for(arch: String, name: String) -> String:
+    """Map a daemon-scanned (arch, name) to the CLI backend registry name.
+    '' = no CLI backend for this arch."""
+    if arch == String("cli"):
+        return name.copy()
+    if arch == String("zimage"):
+        if name.find(String("turbo")) >= 0:
+            return String("Z-Image (turbo)")
+        return String("Z-Image (base)")
+    if arch == String("flux-2/klein"):
+        if name.find(String("4b")) >= 0:
+            return String("Klein 4B")
+        return String("Klein 9B")
+    if arch == String("flux"):
+        return String("FLUX Dev")
+    if arch == String("chroma"):
+        return String("Chroma")
+    if arch == String("sd3"):
+        return String("SD 3.5")
+    if arch == String("sdxl"):
+        return String("SDXL")
+    if arch == String("qwen-image"):
+        return String("Qwen-Image")
+    if arch == String("anima"):
+        return String("Anima")
+    return String("")
+
+
+def _selected_arch(s: InferenceUIState) -> String:
+    var i = Int(s.store.m_model_index)
+    if i < 0 or i >= len(s.model_archs):
+        return String("")
+    return s.model_archs[i].copy()
+
+
+def _sync_lora_open(mut s: InferenceUIState):
+    """Keep the per-row combobox open-flag list sized to the store's rows."""
+    while len(s.lora_row_open) < len(s.store.m_lora_indices):
+        s.lora_row_open.append(False)
+    while len(s.lora_row_open) > len(s.store.m_lora_indices):
+        _ = s.lora_row_open.pop()
+
+
+def _refresh_store(mut s: InferenceUIState):
+    """Subscriber re-read (H2): rebuild widget mirrors + text engines when
+    params changed via set() outside the mirror commit (preset load,
+    reuse-params, seed resolution at submit)."""
+    var lnames = s.lora_names.copy()
+    var refreshed = s.store.refresh_mirrors(
+        s.model_names, s.model.sampler_options, s.model.scheduler_options, lnames
+    )
+    s.lora_names = lnames^
+    if refreshed:
+        s.prompt_edit.set_text(s.store.m_prompt)
+        s.negative_edit.set_text(s.store.m_negative)
+    _sync_lora_open(s)
+
+
+def _commit_store(mut s: InferenceUIState):
+    """End-of-frame commit: widget mirrors -> store.set() when changed (the
+    single H2 dispatch point — see GenParamStore.commit_mirrors)."""
+    try:
+        _ = s.store.commit_mirrors(
+            s.model_names, s.model.sampler_options,
+            s.model.scheduler_options, s.lora_names,
+        )
+    except e:
+        print("[gen-screen] commit failed:", String(e))
+
+
+def _drain_daemon_done(mut s: InferenceUIState):
+    """Move the bridge's terminal-job events into persistent history (P14)."""
+    var n = len(s.zrt.daemon_done_events)
+    if n == 0:
+        return
+    for i in range(n):
+        var ev = s.zrt.daemon_done_events[i].copy()
+        if ev.state != String("done"):
+            s.menu_status = ev.id + String(" ") + ev.state
+            continue
+        var item = GalleryItem()
+        item.job_id = ev.id.copy()
+        item.created = ev.created.copy()
+        item.model = ev.model.copy()
+        item.state = ev.state.copy()
+        item.output_path = absolutize_output_path(ev.output_path)
+        try:
+            item.params_json = read_genparams_from_png(item.output_path)
+        except:
+            item.params_json = s.zrt.last_submit_json.copy()
+        for k in range(len(s.starred_ids)):
+            if s.starred_ids[k] == item.job_id:
+                item.starred = True
+                break
+        # de-dup (a poll can race a db reload)
+        var seen = False
+        for k in range(len(s.gallery)):
+            if s.gallery[k].job_id == item.job_id:
+                seen = True
+                break
+        if not seen:
+            s.gallery.append(item^)
+        s.menu_status = ev.id + String(" done")
+    s.zrt.daemon_done_events = List[DaemonJobInfo]()
+
+
+def _reuse_params_from_item(mut s: InferenceUIState, idx: Int):
+    """P15: restore ALL params from the output PNG's serenity.genparams.v1
+    tEXt chunk through the H2 dispatch (widgets re-read next frame)."""
+    if idx < 0 or idx >= len(s.gallery):
+        return
+    var pj: String
+    try:
+        pj = read_genparams_from_png(s.gallery[idx].output_path)
+    except:
+        pj = s.gallery[idx].params_json.copy()  # db fallback (PNG moved?)
+    try:
+        var p = GenParams.from_json(pj)
+        s.store.set(p^)
+        s.menu_status = String("params restored from ") + s.gallery[idx].job_id
+    except e:
+        s.menu_status = String("reuse-params failed: ") + String(e)
+
+
+def _toggle_star(mut s: InferenceUIState, idx: Int):
+    """P16: star/favorite toggle, persisted to ~/.serenity/ui_stars.json."""
+    if idx < 0 or idx >= len(s.gallery):
+        return
+    s.gallery[idx].starred = not s.gallery[idx].starred
+    var ids = List[String]()
+    for i in range(len(s.gallery)):
+        if s.gallery[i].starred:
+            ids.append(s.gallery[i].job_id.copy())
+    s.starred_ids = ids.copy()
+    save_stars(ids)
+
+
+def _do_save_preset(mut s: InferenceUIState):
+    try:
+        var name = save_preset(s.preset_name_buf, s.store.params.to_json())
+        s.presets = list_presets()
+        for i in range(len(s.presets)):
+            if s.presets[i] == name:
+                s.preset_index = Int32(i)
+        s.menu_status = String("preset saved: ") + name
+    except e:
+        s.menu_status = String("preset save failed: ") + String(e)
+
+
+def _do_load_preset(mut s: InferenceUIState):
+    var idx = Int(s.preset_index)
+    if idx < 0 or idx >= len(s.presets):
+        s.menu_status = String("no preset selected")
+        return
+    try:
+        var p = GenParams.from_json(load_preset(s.presets[idx]))
+        s.store.set(p^)   # H2 dispatch; mirrors refresh next frame
+        s.menu_status = String("preset loaded: ") + s.presets[idx]
+    except e:
+        s.menu_status = String("preset load failed: ") + String(e)
+
+
+def _sync_params_to_state(mut s: InferenceUIState, p: GenParams, cli_name: String):
+    """CLI fallback: project the canonical params onto the legacy
+    InferenceState the blocking CLI path consumes."""
+    s.model.prompt = p.prompt.copy()
+    s.model.negative = p.negative.copy()
+    s.model.width = Float32(p.width)
+    s.model.height = Float32(p.height)
+    s.model.steps = Float32(p.steps)
+    s.model.cfg = Float32(p.cfg)
+    s.model.seed = Float32(p.seed)
+    s.model.cli_model_override = cli_name.copy()
+    for i in range(len(s.model.sampler_options)):
+        if s.model.sampler_options[i] == p.sampler:
+            s.model.sampler_index = Int32(i)
+    for i in range(len(s.model.scheduler_options)):
+        if s.model.scheduler_options[i] == p.scheduler:
+            s.model.scheduler_index = Int32(i)
+
+
+def _submit_generate(mut s: InferenceUIState):
+    """P11: Generate -> daemon (health-checked) with CLI fallback. Routing:
+    arch zimage at 512x512 -> daemon; everything else -> CLI spawn."""
+    _commit_store(s)
+    var p = s.store.params.copy()
+    # resolve a random seed request to a concrete seed (reproducible reuse)
+    if p.seed < 0:
+        s.pseudo_rng = s.pseudo_rng * UInt32(1664525) + UInt32(1013904223)
+        p.seed = Int(s.pseudo_rng % UInt32(1000000))
+    if not p.same_as(s.store.params):
+        try:
+            s.store.set(p.copy())  # H2: the submitted seed IS the param state
+        except e:
+            print("[gen-screen] seed store.set failed:", String(e))
+    var arch = _selected_arch(s)
+    var route_daemon = (
+        arch == String("zimage") and p.width == 512 and p.height == 512
+    )
+    if route_daemon:
+        daemon_refresh_health(s.zrt)  # health-check on Generate (bridge spec)
+        route_daemon = s.zrt.daemon_ok
+    if route_daemon:
+        var all_ok = True
+        for k in range(p.images):  # P6: one daemon job per image
+            var pk = p.copy()
+            pk.seed = p.seed + k
+            try:
+                if not daemon_submit_params(
+                    s.model, s.zrt, pk.to_json(), pk.width, pk.height, pk.steps
+                ):
+                    all_ok = False
+                    break
+            except e:
+                print("[gen-screen] submit error:", String(e))
+                all_ok = False
+                break
+        if all_ok:
+            s.menu_status = String("daemon: generating")
+            return
+        s.menu_status = String("daemon submit failed -> CLI fallback")
+    # CLI fallback (blocking, the proven path)
+    var cli_name = _cli_name_for(arch, p.model)
+    if cli_name.byte_length() == 0:
+        s.menu_status = String("no CLI backend for arch '") + arch + String("'")
+        s.zrt.last_error = s.menu_status.copy()
+        return
+    _sync_params_to_state(s, p, cli_name)
+    s.zrt.route_label = String("cli")
+    s.menu_status = String("CLI: ") + cli_name
+    graph_submit_current(s.model, s.zrt)
+
+
+def _cancel_generate(mut s: InferenceUIState):
+    if len(s.zrt.daemon_submitted) > 0:
+        daemon_cancel_submitted(s.model, s.zrt)
+    else:
+        graph_cancel_all(s.model, s.zrt)
 
 
 def _add_node_workflow_preset(
@@ -647,8 +1066,17 @@ def _section_model(mut s: InferenceUIState) raises:
                      s.model.task_index, s.model.task_open)
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("Model:"))
-        _ = combobox(ctx, String("model"), s.model.model_options,
-                     s.model.model_index, s.model.model_open)
+        _ = combobox(ctx, String("model"), s.model_display,
+                     s.store.m_model_index, s.model_combo_open)
+        ctx.layout_row(_row1(_left_full_w(s)), _px(s, 20))
+        if s.models_from_daemon:
+            var arch = _selected_arch(s)
+            var route = String("route: daemon") if arch == String("zimage") else (
+                String("route: CLI (") + _cli_name_for(arch, String("")) + String(")")
+            )
+            label(ctx, route)
+        else:
+            label(ctx, String("daemon down — static CLI list"))
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("VAE:"))
         _ = combobox(ctx, String("vae"), s.model.vae_options,
@@ -660,85 +1088,155 @@ def _section_model(mut s: InferenceUIState) raises:
 
 
 def _section_resolution(mut s: InferenceUIState) raises:
+    """P3: aspect presets + swap + custom W/H (bound to the param store)."""
     ref ctx = s.ctx
     if collapsing_header(ctx, String("Resolution"), s.sec_resolution):
-        ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
-        label(ctx, String("Preset:"))
-        _ = combobox(ctx, String("respreset"), s.model.resolution_options,
-                     s.model.resolution_index, s.model.resolution_open)
+        var bw = (_left_full_w(s) - _px(s, 12)) / 4
+        ctx.layout_row(_row4(bw, bw, bw, bw), _px(s, 26))
+        if button(ctx, String("1:1")):
+            s.store.m_width = 1024.0
+            s.store.m_height = 1024.0
+        if button(ctx, String("3:2")):
+            s.store.m_width = 1216.0
+            s.store.m_height = 832.0
+        if button(ctx, String("16:9")):
+            s.store.m_width = 1344.0
+            s.store.m_height = 768.0
+        if button(ctx, String("9:16")):
+            s.store.m_width = 768.0
+            s.store.m_height = 1344.0
+        ctx.layout_row(_row2(bw * 2 + _px(s, 4), bw * 2), _px(s, 26))
+        if button(ctx, String("512 · 1:1")):
+            s.store.m_width = 512.0
+            s.store.m_height = 512.0
+        if button(ctx, String("Swap W/H")):
+            var t = s.store.m_width
+            s.store.m_width = s.store.m_height
+            s.store.m_height = t
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("Width:"))
-        _ = slider(ctx, s.model.width, Float32(256.0), Float32(2048.0), String("width"))
+        _ = drag_value(ctx, s.store.m_width, String("width"), Float32(8.0))
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("Height:"))
-        _ = slider(ctx, s.model.height, Float32(256.0), Float32(2048.0), String("height"))
+        _ = drag_value(ctx, s.store.m_height, String("height"), Float32(8.0))
+        if _selected_arch(s) == String("zimage") and (
+            Int(s.store.m_width) != 512 or Int(s.store.m_height) != 512
+        ):
+            ctx.layout_row(_row1(_left_full_w(s)), _px(s, 20))
+            label(ctx, String("daemon: 512 only — this size runs via CLI"))
 
 
 def _section_sampling(mut s: InferenceUIState) raises:
+    """P4: steps / CFG / sampler / scheduler (store-bound; static lists)."""
     ref ctx = s.ctx
     if collapsing_header(ctx, String("Sampling"), s.sec_sampling):
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("Sampler:"))
         _ = combobox(ctx, String("sampler"), s.model.sampler_options,
-                     s.model.sampler_index, s.model.sampler_open)
+                     s.store.m_sampler_index, s.model.sampler_open)
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("Scheduler:"))
         _ = combobox(ctx, String("scheduler"), s.model.scheduler_options,
-                     s.model.scheduler_index, s.model.scheduler_open)
+                     s.store.m_scheduler_index, s.model.scheduler_open)
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("Steps:"))
-        _ = slider(ctx, s.model.steps, Float32(1.0), Float32(100.0), String("steps"))
+        _ = slider(ctx, s.store.m_steps, Float32(1.0), Float32(100.0), String("steps"))
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("CFG:"))
-        _ = drag_value(ctx, s.model.cfg, String("cfg"), Float32(0.1))
+        _ = drag_value(ctx, s.store.m_cfg, String("cfg"), Float32(0.1))
 
 
 def _section_seed(mut s: InferenceUIState) raises:
+    """P5: seed + randomize + variation seed + variation strength."""
     ref ctx = s.ctx
     if collapsing_header(ctx, String("Seed"), s.sec_seed):
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
         label(ctx, String("Seed:"))
-        _ = drag_value(ctx, s.model.seed, String("seed"), Float32(1.0))
+        _ = drag_value(ctx, s.store.m_seed, String("seed"), Float32(1.0))
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
-        label(ctx, String("Mode:"))
-        _ = combobox(ctx, String("seedmode"), s.model.seed_mode_options,
-                     s.model.seed_mode_index, s.model.seed_mode_open)
-        ctx.layout_row(_row1(_left_full_w(s)), _px(s, 28))
-        _ = checkbox(ctx, String("Lock seed"), s.model.seed_locked)
+        label(ctx, String(""))
+        if button(ctx, String("Randomize")):
+            s.pseudo_rng = s.pseudo_rng * UInt32(1664525) + UInt32(1013904223)
+            s.store.m_seed = Float32(Int(s.pseudo_rng % UInt32(1000000)))
+        ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
+        label(ctx, String("Var seed:"))
+        _ = drag_value(ctx, s.store.m_variation_seed, String("var_seed"), Float32(1.0))
+        ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
+        label(ctx, String("Var strength:"))
+        _ = drag_value(
+            ctx, s.store.m_variation_strength, String("var_strength"), Float32(0.01)
+        )
+        if s.store.m_variation_strength < 0.0:
+            s.store.m_variation_strength = 0.0
+        if s.store.m_variation_strength > 1.0:
+            s.store.m_variation_strength = 1.0
 
 
 def _section_lora(mut s: InferenceUIState) raises:
+    """P2: multi-LoRA stack — add/remove rows backed by the daemon's
+    /v1/models lora scan + per-row weight slider 0..2."""
     ref ctx = s.ctx
     if collapsing_header(ctx, String("LoRA"), s.sec_lora):
-        var n = len(s.model.loras)
-        for i in range(n):
-            ctx.layout_row(_row3(_px(s, 140), _px(s, 168), _px(s, 50)), _px(s, 26))
-            label(ctx, s.model.loras[i].name)
-            _ = slider(ctx, s.model.loras[i].strength, Float32(0.0),
-                       Float32(2.0), String("lora_str_") + String(i))
-            _ = checkbox(ctx, String(""), s.model.loras[i].active)
-        ctx.layout_row(_row2(_px(s, 180), _left_full_w(s) - _px(s, 180)), _px(s, 28))
-        if button(ctx, String("+ Add LoRA")):
-            s.model.loras.append(
-                LoraSlot(String("new-lora.safetensors"), Float32(1.0), True)
+        _sync_lora_open(s)
+        var remove_at = -1
+        for i in range(len(s.store.m_lora_indices)):
+            ctx.layout_row(
+                _row3(_px(s, 168), _px(s, 142), _px(s, 30)), _px(s, 26)
             )
-        if button(ctx, String("- Remove last")):
-            if len(s.model.loras) > 0:
-                var keep = List[LoraSlot]()
-                for j in range(len(s.model.loras) - 1):
-                    keep.append(s.model.loras[j].copy())
-                s.model.loras = keep^
+            var open_flag = s.lora_row_open[i]
+            _ = combobox(ctx, String("lora_sel_") + String(i), s.lora_names,
+                         s.store.m_lora_indices[i], open_flag)
+            s.lora_row_open[i] = open_flag
+            _ = slider(ctx, s.store.m_lora_weights[i], Float32(0.0),
+                       Float32(2.0), String("lora_w_") + String(i))
+            # NOTE: button ids hash the label — keep per-row labels unique
+            if button(ctx, String("x") + String(i + 1)):
+                remove_at = i
+        if remove_at >= 0:
+            var keep_idx = List[Int32]()
+            var keep_w = List[Float32]()
+            var keep_open = List[Bool]()
+            for j in range(len(s.store.m_lora_indices)):
+                if j == remove_at:
+                    continue
+                keep_idx.append(s.store.m_lora_indices[j])
+                keep_w.append(s.store.m_lora_weights[j])
+                keep_open.append(s.lora_row_open[j])
+            s.store.m_lora_indices = keep_idx^
+            s.store.m_lora_weights = keep_w^
+            s.lora_row_open = keep_open^
+        ctx.layout_row(_row1(_px(s, 180)), _px(s, 28))
+        if button(ctx, String("+ Add LoRA")):
+            if len(s.lora_names) > 0:
+                s.store.m_lora_indices.append(Int32(0))
+                s.store.m_lora_weights.append(Float32(1.0))
+                s.lora_row_open.append(False)
 
 
 def _section_batch(mut s: InferenceUIState) raises:
+    """P6: images-count (each image = one queued daemon job)."""
     ref ctx = s.ctx
-    if collapsing_header(ctx, String("Batch"), s.sec_batch):
+    if collapsing_header(ctx, String("Images"), s.sec_batch):
         ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
-        label(ctx, String("Count:"))
-        _ = slider(ctx, s.model.batch_count, Float32(1.0), Float32(16.0), String("bcount"))
-        ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
-        label(ctx, String("Size:"))
-        _ = slider(ctx, s.model.batch_size, Float32(1.0), Float32(8.0), String("bsize"))
+        label(ctx, String("Count: ") + String(Int(s.store.m_images)))
+        _ = slider(ctx, s.store.m_images, Float32(1.0), Float32(8.0), String("images"))
+
+
+def _section_presets(mut s: InferenceUIState) raises:
+    """P8: named param presets (JSON files under ~/.serenity/ui_presets/)."""
+    ref ctx = s.ctx
+    if collapsing_header(ctx, String("Presets"), s.sec_presets):
+        var bw = _px(s, 80)
+        ctx.layout_row(_row2(_left_full_w(s) - bw - _px(s, 4), bw), _px(s, 28))
+        _ = combobox(ctx, String("preset_sel"), s.presets,
+                     s.preset_index, s.preset_open)
+        if button(ctx, String("Load")):
+            _do_load_preset(s)
+        ctx.layout_row(_row2(_left_full_w(s) - bw - _px(s, 4), bw), _px(s, 28))
+        _ = text_edit(ctx, String("preset_name"), s.preset_name_buf,
+                      s.preset_name_state)
+        if button(ctx, String("Save")):
+            _do_save_preset(s)
 
 
 def _section_advanced(mut s: InferenceUIState) raises:
@@ -788,6 +1286,7 @@ def _left_panel(mut s: InferenceUIState) raises:
     _section_seed(s)
     _section_lora(s)
     _section_batch(s)
+    _section_presets(s)
     _section_advanced(s)
 
 
@@ -796,18 +1295,18 @@ def _center_panel(mut s: InferenceUIState, col_x: Float32) raises:
     # task/mode header
     ctx.layout_row(_row1(_center_w(s)), _px(s, 30))
     label(ctx, String("Image  ·  ") + s.model.task_short()
-          + String("  ·  ") + s.model.model_label())
+          + String("  ·  ") + s.store.params.model)
 
     ctx.layout_row(_row1(_center_w(s)), _px(s, 24))
     label(ctx, String("Prompt:"))
     ctx.layout_row(_row1(_center_w(s)), _px(s, 80))
-    if text_area(ctx, String("prompt"), s.model.prompt, s.prompt_edit):
+    if text_area(ctx, String("prompt"), s.store.m_prompt, s.prompt_edit):
         pass
 
     ctx.layout_row(_row1(_center_w(s)), _px(s, 24))
     label(ctx, String("Negative:"))
     ctx.layout_row(_row1(_center_w(s)), _px(s, 56))
-    if text_area(ctx, String("negative"), s.model.negative, s.negative_edit):
+    if text_area(ctx, String("negative"), s.store.m_negative, s.negative_edit):
         pass
 
     # action bar
@@ -815,13 +1314,13 @@ def _center_panel(mut s: InferenceUIState, col_x: Float32) raises:
     label(ctx, String(""))
     if s.model.generating:
         if button(ctx, String("Cancel")):
-            graph_cancel_all(s.model, s.zrt)
+            _cancel_generate(s)
     else:
         if button_primary(ctx, String("Generate")):
-            graph_submit_current(s.model, s.zrt)
+            _submit_generate(s)
     if button(ctx, String("Randomize seed")):
         s.pseudo_rng = s.pseudo_rng * UInt32(1664525) + UInt32(1013904223)
-        s.model.seed = Float32(Int(s.pseudo_rng % UInt32(1000000)))
+        s.store.m_seed = Float32(Int(s.pseudo_rng % UInt32(1000000)))
 
     # image preview
     ctx.layout_row(_row1(_center_w(s)), _px(s, 460))
@@ -861,30 +1360,70 @@ def _right_panel(mut s: InferenceUIState, col_x: Float32) raises:
     separator(ctx)
 
     if s.model.queue_tab == 0:
-        if s.model.has_running:
+        # P12: the queue rail renders the daemon's /v1/jobs directly
+        var jobs = s.zrt.daemon_jobs_cache.copy()
+        var nj = len(jobs)
+        if s.zrt.daemon_ok and nj > 0:
+            var shown = 0
+            for i in range(nj):
+                var idx = nj - 1 - i  # newest first
+                if shown >= 12:
+                    break
+                shown += 1
+                ctx.layout_row(_row1(_right_w(s)), _px(s, 22))
+                var mark = String("· ")
+                if jobs[idx].state == String("running"):
+                    mark = String("▶ ")
+                elif jobs[idx].state == String("done"):
+                    mark = String("✓ ")
+                label(ctx, mark + jobs[idx].id + String("  ")
+                      + jobs[idx].state + String("  ")
+                      + String(jobs[idx].step) + String("/")
+                      + String(jobs[idx].total))
+                if jobs[idx].state == String("running"):
+                    ctx.layout_row(_row1(_right_w(s)), _px(s, 14))
+                    var frac = Float32(0.0)
+                    if jobs[idx].total > 0:
+                        frac = Float32(jobs[idx].step) / Float32(jobs[idx].total)
+                    progress_bar(ctx, frac)
+        elif s.model.has_running:
+            # CLI fallback path: the in-memory mirror
             ctx.layout_row(_row1(_right_w(s)), _px(s, 22))
             label(ctx, String("▶ running #") + String(s.model.running.id))
             ctx.layout_row(_row1(_right_w(s)), _px(s, 16))
             progress_bar(ctx, s.model.running.progress())
-        var nq = len(s.model.queued)
-        for i in range(nq):
+        else:
             ctx.layout_row(_row1(_right_w(s)), _px(s, 22))
-            label(ctx, String("· queued #") + String(s.model.queued[i].id)
-                  + String("  ") + String(Int(s.model.queued[i].width))
-                  + String("x") + String(Int(s.model.queued[i].height)))
-        if (not s.model.has_running) and nq == 0:
-            ctx.layout_row(_row1(_right_w(s)), _px(s, 22))
-            label(ctx, String("(queue empty)"))
+            var msg = String("(queue empty)")
+            if not s.zrt.daemon_ok:
+                msg = String("(queue empty · daemon down)")
+            label(ctx, msg)
     else:
-        var nh = len(s.model.history)
+        # P14-P16: persistent history (jobs.db + session) with star + reuse
+        var nh = len(s.gallery)
         if nh == 0:
             ctx.layout_row(_row1(_right_w(s)), _px(s, 22))
             label(ctx, String("(no history)"))
+        var shown = 0
+        var star_clicked = -1
+        var reuse_clicked = -1
         for i in range(nh):
             var idx = nh - 1 - i  # newest first
-            ctx.layout_row(_row1(_right_w(s)), _px(s, 22))
-            label(ctx, String("✓ #") + String(s.model.history[idx].id)
-                  + String("  seed ") + String(s.model.history[idx].seed))
+            if shown >= 14:
+                break
+            shown += 1
+            ctx.layout_row(_row2(_px(s, 34), _px(s, 290)), _px(s, 24))
+            var star_lbl = String("★ ") if s.gallery[idx].starred else String("☆ ")
+            # unique per-row labels (button ids hash the label)
+            if button(ctx, star_lbl + String(idx)):
+                star_clicked = idx
+            if button(ctx, s.gallery[idx].job_id + String(" · ")
+                      + s.gallery[idx].model):
+                reuse_clicked = idx
+        if star_clicked >= 0:
+            _toggle_star(s, star_clicked)
+        if reuse_clicked >= 0:
+            _reuse_params_from_item(s, reuse_clicked)
 
     # perf footer drawn as absolute text at the bottom of the right column
     if s.font_id != 0:
@@ -1046,8 +1585,11 @@ def _status_bar(mut s: InferenceUIState):
     var dot = _fpx(s, 7.0)
     ctx.draw_rect(Rect(_fpx(s, 10.0), y + (h - dot) * 0.5, dot, dot),
                   Color(90, 200, 120, 255))
+    var daemon_lbl = String("daemon ok (") + s.zrt.daemon_backend + String(")") \
+        if s.zrt.daemon_ok else String("daemon down → CLI")
     ctx.draw_text(s.font_id, fs, Vec2(_fpx(s, 24.0), ty), Color(150, 150, 165, 255),
-                  String("backend connected  ·  serenitymojo  ·  ")
+                  daemon_lbl
+                  + String("  ·  ")
                   + graph_backend_label(s.zrt)
                   + String("  ·  ")
                   + s.menu_status)
@@ -1307,8 +1849,52 @@ def _frame() -> None:
     # Advance graph-runtime state before building the UI so completed-result
     # textures are current this frame.
     graph_tick_and_apply(sp[].model, sp[].zrt)
+    _drain_daemon_done(sp[])
+    # H2 subscriber re-read: external store.set() (preset load / reuse-params)
+    # lands in the widget mirrors before the widgets draw.
+    _refresh_store(sp[])
     _refresh_perf_telemetry(sp[])
     _sync_result_texture(sp[])
+
+    # TEMPORARY scripted-gate driver (--selftest-ui / --selftest-ui-cancel):
+    # triggers the SAME functions the Generate/Cancel buttons call.
+    sp[].frame_no += 1
+    if sp[].autogen_mode == 1 or sp[].autogen_mode == 2:
+        if sp[].frame_no == 150:
+            _submit_generate(sp[])
+        if (
+            sp[].autogen_mode == 2 and sp[].model.generating
+            and Int(sp[].model.current_step) >= 5
+        ):
+            # cancel once the job is visibly mid-denoise (step-aware: frame
+            # timing varies with redraw cost)
+            _cancel_generate(sp[])
+            sp[].autogen_mode = 4  # cancelled; don't repeat
+    elif sp[].autogen_mode == 3 and sp[].frame_no == 150:
+        # reuse-params from the newest history item — the SAME function a
+        # history-row click calls (G2c evidence)
+        sp[].model.queue_tab = 1
+        _reuse_params_from_item(sp[], len(sp[].gallery) - 1)
+    elif sp[].autogen_mode == 5:
+        # preset round-trip (G2d): save -> scramble -> load, via the SAME
+        # functions the Save/Load buttons call
+        if sp[].frame_no == 150:
+            sp[].preset_name_buf = String("uigate-roundtrip")
+            _do_save_preset(sp[])
+        elif sp[].frame_no == 250:
+            # scramble through the widget mirrors (what user edits do)
+            sp[].store.m_prompt = String("scrambled: totally different prompt")
+            sp[].prompt_edit.set_text(sp[].store.m_prompt)
+            sp[].store.m_steps = 77.0
+            sp[].store.m_cfg = 9.9
+            sp[].store.m_seed = 1.0
+            sp[].store.m_width = 1344.0
+            sp[].store.m_height = 768.0
+        elif sp[].frame_no == 1500:
+            for i in range(len(sp[].presets)):
+                if sp[].presets[i] == String("uigate-roundtrip"):
+                    sp[].preset_index = Int32(i)
+            _do_load_preset(sp[])
 
     sp[].ctx.begin_frame(Vec2(sp[].win_w, sp[].win_h))
     Backend.frame_begin(Color(18, 18, 22, 255))
@@ -1317,11 +1903,171 @@ def _frame() -> None:
     except e:
         print("MojoUI m8 UI error:", String(e))
     sp[].ctx.end_frame()
+    # H2 commit: widget-mirror edits flow through store.set() exactly once
+    # per frame (no param state lives outside the store across frames).
+    _commit_store(sp[])
     try:
         _render_command_buffer(sp[].ctx)
     except e:
         print("MojoUI m8 walker error:", String(e))
     Backend.frame_end()
+
+
+# ---------------------------------------------------------------------------
+# TEMPORARY scripted-gate selftests (--selftest / --selftest-cancel /
+# --selftest-preset). Headless: they exercise the SAME store (H1/H2) and the
+# SAME daemon submit/poll/cancel functions the UI buttons use, without a
+# window. Clearly marked; fine to keep for regression runs.
+# ---------------------------------------------------------------------------
+
+
+def _selftest_wait_terminal(job_id: String, max_ticks: Int) raises -> DaemonJobInfo:
+    var last_step = -1
+    for _ in range(max_ticks):
+        sleep(Float64(0.1))
+        var jobs = daemon_jobs()
+        for i in range(len(jobs)):
+            if jobs[i].id != job_id:
+                continue
+            if jobs[i].step != last_step:
+                last_step = jobs[i].step
+                print("[selftest] ", job_id, jobs[i].state, " step ",
+                      jobs[i].step, "/", jobs[i].total)
+            if jobs[i].is_terminal():
+                return jobs[i].copy()
+    raise Error("selftest: job " + job_id + " did not finish in time")
+
+
+def _selftest_daemon_e2e() raises:
+    """G2b/G2f headless: store -> daemon -> PNG tEXt round-trip."""
+    print("[selftest] === daemon e2e + genparams round-trip ===")
+    var state = InferenceState()
+    var rt = GraphUiRuntime()
+    daemon_refresh_health(rt)
+    if not rt.daemon_ok:
+        raise Error("selftest: daemon not running on 127.0.0.1:7801")
+    print("[selftest] health ok, backend =", rt.daemon_backend)
+    var models = List[DaemonModelEntry]()
+    var loras = List[DaemonLoraEntry]()
+    daemon_models(models, loras)
+    print("[selftest] /v1/models:", len(models), "models,", len(loras), "loras")
+
+    # H1: one canonical param struct, set through the H2 dispatch point.
+    var store = GenParamStore()
+    var p = GenParams()
+    p.model = String("zimage_base")
+    p.prompt = String("selftest: neon koi pond at midnight, ukiyo-e")
+    p.negative = String("blurry")
+    p.width = 512
+    p.height = 512
+    p.steps = 6
+    p.seed = 4242
+    p.cfg = 3.25
+    p.sampler = String("euler")
+    p.scheduler = String("simple")
+    p.variation_seed = 777
+    p.variation_strength = 0.55
+    p.images = 1
+    if len(loras) > 0:
+        p.loras.append(GenLora(loras[0].name.copy(), 1.35))
+    store.set(p^)
+    print("[selftest] UI genparams JSON:", store.last_set_json)
+
+    if not daemon_submit_params(
+        state, rt, store.last_set_json,
+        store.params.width, store.params.height, store.params.steps,
+    ):
+        raise Error("selftest: daemon submit failed: " + rt.last_error)
+    var job_id = rt.daemon_submitted[0].copy()
+    var job = _selftest_wait_terminal(job_id, 1200)
+    if job.state != String("done"):
+        raise Error("selftest: job ended " + job.state + " err=" + job.error)
+    var out = absolutize_output_path(job.output_path)
+    print("[selftest] output:", out)
+
+    # G2f: UI-state JSON == daemon-recorded PNG tEXt (modulo server job_id)
+    var png_json = read_genparams_from_png(out)
+    print("[selftest] PNG tEXt genparams:", png_json)
+    var sent = GenParams.from_json(store.last_set_json)
+    var got = GenParams.from_json(png_json)
+    if not sent.same_as(got):
+        raise Error("selftest: genparams MISMATCH between UI state and PNG tEXt")
+    print("[selftest] PASS genparams round-trip (UI == daemon tEXt)")
+
+    # P15/H2 observer round-trip: reuse-params through set() and re-emit
+    var store2 = GenParamStore()
+    store2.set(got^)
+    var re = GenParams.from_json(store2.last_set_json)
+    if not re.same_as(sent):
+        raise Error("selftest: reuse-params re-serialize mismatch")
+    print("[selftest] PASS reuse-params observer round-trip")
+
+
+def _selftest_cancel() raises:
+    """G2b: cancel a 50-step stub job mid-run (+ double-cancel -> 409)."""
+    print("[selftest] === cancel mid-run ===")
+    var state = InferenceState()
+    var rt = GraphUiRuntime()
+    daemon_refresh_health(rt)
+    if not rt.daemon_ok:
+        raise Error("selftest: daemon not running")
+    var p = GenParams()
+    p.model = String("zimage_base")
+    p.prompt = String("selftest cancel probe")
+    p.steps = 50
+    p.seed = 7
+    if not daemon_submit_params(state, rt, p.to_json(), p.width, p.height, p.steps):
+        raise Error("selftest: submit failed")
+    var job_id = rt.daemon_submitted[0].copy()
+    # wait until visibly running (a few steps in)
+    var running = False
+    for _ in range(300):
+        sleep(Float64(0.1))
+        var jobs = daemon_jobs()
+        for i in range(len(jobs)):
+            if jobs[i].id == job_id and jobs[i].state == String("running") \
+                    and jobs[i].step >= 3:
+                running = True
+        if running:
+            break
+    if not running:
+        raise Error("selftest: job never reached running step>=3")
+    _ = daemon_cancel(job_id)
+    print("[selftest] cancel POSTed at running state")
+    var job = _selftest_wait_terminal(job_id, 300)
+    if job.state != String("cancelled"):
+        raise Error("selftest: expected cancelled, got " + job.state)
+    print("[selftest] PASS job cancelled mid-run (step ", job.step, "/50 )")
+    if daemon_cancel(job_id):
+        raise Error("selftest: double-cancel should 409")
+    print("[selftest] PASS double-cancel -> 409")
+
+
+def _selftest_preset() raises:
+    """G2d headless: preset save -> load -> field round-trip."""
+    print("[selftest] === preset round-trip ===")
+    var p = GenParams()
+    p.model = String("zimage_base")
+    p.prompt = String("preset probe: glass cathedral")
+    p.steps = 31
+    p.cfg = 7.5
+    p.seed = 999
+    p.variation_seed = 13
+    p.variation_strength = 0.25
+    p.images = 3
+    p.loras.append(GenLora(String("test-lora"), 0.65))
+    var name = save_preset(String("selftest-preset"), p.to_json())
+    var names = list_presets()
+    var found = False
+    for i in range(len(names)):
+        if names[i] == name:
+            found = True
+    if not found:
+        raise Error("selftest: saved preset not listed")
+    var q = GenParams.from_json(load_preset(name))
+    if not q.same_as(p):
+        raise Error("selftest: preset round-trip mismatch")
+    print("[selftest] PASS preset round-trip:", name)
 
 
 def _graph_seam_selfcheck():
@@ -1335,8 +2081,83 @@ def _graph_seam_selfcheck():
 
 
 def main() raises:
+    # TEMPORARY scripted-gate argv paths (clearly marked; see selftests above)
+    var run_mode = String("")
+    var args = argv()
+    for i in range(1, len(args)):
+        var a = String(args[i])
+        if (
+            a == String("--selftest") or a == String("--selftest-cancel")
+            or a == String("--selftest-preset") or a == String("--selftest-ui")
+            or a == String("--selftest-ui-cancel")
+            or a == String("--selftest-ui-reuse")
+            or a == String("--selftest-ui-preset")
+            or a == String("--selftest-ui-gpu")
+        ):
+            run_mode = a^
+    if run_mode == String("--selftest"):
+        _selftest_daemon_e2e()
+        _selftest_cancel()
+        _selftest_preset()
+        print("[selftest] ALL PASS")
+        return
+    if run_mode == String("--selftest-cancel"):
+        _selftest_cancel()
+        return
+    if run_mode == String("--selftest-preset"):
+        _selftest_preset()
+        return
+
     _graph_seam_selfcheck()
     var state = InferenceUIState()
+    if run_mode == String("--selftest-ui"):
+        state.autogen_mode = 1
+        # distinctive params + a 2-row LoRA stack (G2a/G2b evidence); flows
+        # through the same H2 dispatch a preset-load would use
+        var p = state.store.params.copy()
+        p.prompt = String("ui-gate: crystal lighthouse at dawn, oil painting")
+        p.steps = 12
+        p.seed = 31337
+        p.images = 2   # P6: two queued daemon jobs from one Generate
+        p.variation_seed = 999
+        p.variation_strength = 0.35
+        if len(state.lora_names) > 0:
+            p.loras.append(GenLora(state.lora_names[0].copy(), 0.8))
+        if len(state.lora_names) > 1:
+            p.loras.append(GenLora(state.lora_names[1].copy(), 1.35))
+        state.store.set(p^)
+    elif run_mode == String("--selftest-ui-cancel"):
+        state.autogen_mode = 2
+        # a 50-step job so the auto-cancel lands mid-denoise
+        var p = state.store.params.copy()
+        p.steps = 50
+        state.store.set(p^)
+    elif run_mode == String("--selftest-ui-reuse"):
+        state.autogen_mode = 3
+    elif run_mode == String("--selftest-ui-gpu"):
+        # G2e: one real zimage generation driven entirely from the UI —
+        # plain auto-generate with zimage-safe params (no LoRA, 1 image)
+        state.autogen_mode = 1
+        var p = state.store.params.copy()
+        p.prompt = String("a red bicycle leaning against a blue brick wall, "
+                          "golden hour, photo")
+        p.steps = 20
+        p.seed = 12345
+        p.images = 1
+        state.store.set(p^)
+    elif run_mode == String("--selftest-ui-preset"):
+        state.autogen_mode = 5
+        # distinctive baseline so the round-trip is visible
+        var p = state.store.params.copy()
+        p.prompt = String("preset-gate: amber forest, volumetric fog")
+        p.steps = 33
+        p.cfg = 6.5
+        p.seed = 2026
+        p.variation_seed = 55
+        p.variation_strength = 0.2
+        if len(state.lora_names) > 0:
+            p.loras.append(GenLora(state.lora_names[0].copy(), 1.25))
+        state.store.set(p^)
     var sp = UnsafePointer(to=state)
     store_user_state(sp)
 
