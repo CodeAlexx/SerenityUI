@@ -97,3 +97,13 @@ Comfy-workflow duality). Bake the hooks now, build the node editor later:
    (`workflow` key) is reserved in the schema for later — reject with a clear
    501 today.
 Phase 2 builder/skeptic must enforce H1-H2 in the UI state refactor.
+
+## Phase status (2026-06-10)
+- Phase 1 (backend): DONE — builder+skeptic(10)+bugfix+orchestrator. adffe5e.
+- Phase 2 (UI core, H1/H2): DONE — builder+skeptic(4 HIGH)+bugfix(11/11)+orch.
+  7fb11c1 / MojoUI 93a09d6.
+- Phase 3 (img2img/syntax/batch): DONE — builder+orch+skeptic VERDICT FIT
+  (img2img corr monotone 0.994/0.988/0.893; syntax robust; batch seed-fanout
+  correct). 9f60845 / MojoUI b3a2376. Residual F1 (parser lora-weight clamp/
+  warn) folded into Phase-4 builder brief.
+- Phase 4 (multi-model residency + switching + VRAM): NEXT.
