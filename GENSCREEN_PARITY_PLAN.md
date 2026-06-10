@@ -77,3 +77,23 @@ established), flame-core SPEED_CONTRACT clauses apply (no per-step host
 stalls, no re-upload churn, bench new kernels vs torch at matched shape).
 Phase 4 (added): extend the daemon backend registry to the remaining
 prompt-ready models with per-model residency + the switch protocol.
+
+## North star + node-sync hooks (maintainer 2026-06-10, pre-remote)
+End goal: a pure-Mojo SwarmUI clone, BETTER. Future upgrade: a node-graph
+backend view that follows the main screen IN SYNC (SwarmUI's Generate-tab ⇄
+Comfy-workflow duality). Bake the hooks now, build the node editor later:
+ [H1] SINGLE SOURCE OF TRUTH: the gen screen edits ONE serializable param-state
+   struct whose canonical form IS `serenity.genparams.v1` JSON (same schema as
+   the daemon JobParams + PNG tEXt). No UI-only param state on the side.
+ [H2] OBSERVER SEAM: param-state changes go through a notify hook (single
+   dispatch point) — the future node view subscribes there; the gen screen is
+   itself a subscriber (round-trip safe).
+ [H3] GRAPH MAPPING REGISTRY: per-model canonical workflow template (the
+   existing SerenityFlow node JSONs are the seed); genparams ⇄ graph is a
+   pure mapping (params→fill template ports; graph→extract params). Phase 5
+   (future) implements the editor; Phase 2 must only keep params flat,
+   serializable, and routed through H1/H2.
+ [H4] DAEMON: /v1/generate keeps accepting flat genparams now; a graph body
+   (`workflow` key) is reserved in the schema for later — reject with a clear
+   501 today.
+Phase 2 builder/skeptic must enforce H1-H2 in the UI state refactor.
