@@ -40,3 +40,19 @@ where marked GPU.
 ## Parallel campaigns parked elsewhere
 - LTX2: serenitymojo/docs/LTX2_TODO.md (quality arms + trainer stages 2+).
 - Z-Image/L2P training prepare: 51 samples staged, task #7.
+
+## Phase 4 VRAM work (skeptic F2/F3 vs serve/ daemon @ cd185d6 — deferred by order, 2026-06-10)
+Both findings are REAL VRAM engineering, explicitly out of Phase-1 bugfix
+scope. Mitigation shipped instead: `ZImageBackend.start()` now rejects every
+size except 512x512 with a clear "pending VRAM work (Phase 4)" error (no false
+advertising), so neither path is reachable from /v1/generate.
+- F2 CRITICAL — 1024x1024 zimage job OOMs at decode: the whole-frame 128-grid
+  VAE decode peaks ~23.6 GiB beside the resident DiT (13.2 GiB) on the 24 GB
+  GPU → CUDA OOM. The cd185d6 workaround released the resident DiT before the
+  128-grid decode (next job reloads), which sacrifices the resident-weights
+  win [G-PERF1]. Real fix: tiled/chunked 1024 decode (FLUX 3x3 overlap-blend
+  precedent) or decode-time activation budget so the DiT stays resident.
+- F3 MAJOR — ~8 GB device-pool retention after a job completes: per-job
+  tensors are freed to the DeviceContext pool but the pool does not return
+  the VRAM between jobs (nvidia-smi stays high while idle). Real fix: pool
+  trim/release-to-OS hook between jobs, or per-job sub-pool with reset.
