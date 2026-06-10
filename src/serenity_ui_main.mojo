@@ -78,6 +78,14 @@ from mojoui.app.inference_graph_bridge import (
     _write_text_file,
 )
 from mojoui.app.genparams import GenLora, GenParams, GenParamStore
+from mojoui.app.prompt_syntax import (
+    join_notes,
+    parse_float_strict,
+    resolve_prompt,
+    selftest_prompt_syntax,
+)
+from serenitymojo.serve.image_io import decode_image_any, image_to_rgba_bytes
+from image.transform import resize_bilinear
 from mojoui.app.daemon_client import (
     DaemonJobInfo,
     DaemonLoraEntry,
@@ -198,10 +206,26 @@ struct InferenceUIState(Movable):
     # F1: seed is a TEXT mirror (integer end-to-end) — its edit engine
     var seed_edit: TextEditState
 
+    # ── P7 init image (img2img): edit engine + validation/thumbnail state
+    # (VIEW state only — the param itself lives in store.params.init_image) ──
+    var init_path_state: TextEditState
+    var init_thumb_tex: UInt32
+    var init_thumb_w: Int32
+    var init_thumb_h: Int32
+    var init_status: String
+    var init_validated_path: String   # path the current thumbnail belongs to
+
+    # ── P13 batch thumbnails: this session's last submitted batch ──
+    var batch_job_ids: List[String]
+    var batch_paths: List[String]
+    var batch_tex: List[UInt32]       # lazy-loaded thumb textures (0 = pending)
+    var batch_sel: Int                # selected thumb (preview swap target)
+
     # TEMPORARY --selftest-ui driver (scripted gates): 0=off, 1=auto-generate,
     # 2=auto-generate then auto-cancel. Drives the SAME functions the buttons
     # call. Fine to keep; remove when xdotool-driven gates land.
     var autogen_mode: Int
+    var autogen_stamp: Int   # frame stamp for multi-step scripted gates
     var frame_no: Int
 
     # collapsing-header open flags (left panel)
@@ -211,6 +235,7 @@ struct InferenceUIState(Movable):
     var sec_seed: Bool
     var sec_lora: Bool
     var sec_batch: Bool
+    var sec_init: Bool       # P7 init-image section
     var sec_presets: Bool
     var sec_advanced: Bool
 
@@ -268,7 +293,18 @@ struct InferenceUIState(Movable):
         self.queue_page = 0
         self.starred_first = False
         self.seed_edit = TextEditState(single_line=True)
+        self.init_path_state = TextEditState(single_line=True)
+        self.init_thumb_tex = UInt32(0)
+        self.init_thumb_w = 0
+        self.init_thumb_h = 0
+        self.init_status = String("")
+        self.init_validated_path = String("")
+        self.batch_job_ids = List[String]()
+        self.batch_paths = List[String]()
+        self.batch_tex = List[UInt32]()
+        self.batch_sel = 0
         self.autogen_mode = 0
+        self.autogen_stamp = 0
         self.frame_no = 0
 
         self.prompt_edit = MultiLineState()
@@ -279,6 +315,7 @@ struct InferenceUIState(Movable):
         self.sec_seed = True
         self.sec_lora = True
         self.sec_batch = True
+        self.sec_init = True
         self.sec_presets = True
         self.sec_advanced = False
         self.pseudo_rng = 0x9E3779B9
@@ -496,6 +533,123 @@ def _commit_store(mut s: InferenceUIState):
         print("[gen-screen] commit failed:", String(e))
 
 
+def _resolve_prompt_syntax(mut p: GenParams, mut notes: List[String]):
+    """P9/P10 submit-time resolution against the CONCRETE job seed:
+    (text:w) passes through (validated), <lora:> extractions are merged into
+    the LoRA stack (dedup by name — the UI stack wins), <random:> picks are
+    seed-deterministic. The ORIGINAL prompt is preserved in prompt_raw; the
+    resolved prompt goes in prompt. No syntax -> prompt_raw stays ''."""
+    var raw = p.prompt.copy()
+    if p.prompt_raw.byte_length() > 0:
+        raw = p.prompt_raw.copy()  # re-resolve from the original (reuse-params)
+    var parsed = resolve_prompt(raw, p.seed)
+    for i in range(len(parsed.notes)):
+        notes.append(parsed.notes[i].copy())
+    if parsed.had_syntax:
+        p.prompt_raw = raw^
+        p.prompt = parsed.resolved.copy()
+        for i in range(len(parsed.loras)):
+            var dup = False
+            for k in range(len(p.loras)):
+                if p.loras[k].name == parsed.loras[i].name:
+                    dup = True  # dedup vs the UI stack (UI weight wins)
+                    break
+            if not dup:
+                p.loras.append(GenLora(
+                    parsed.loras[i].name.copy(), parsed.loras[i].weight
+                ))
+    else:
+        p.prompt_raw = String("")
+
+
+def _clear_init_thumb(mut s: InferenceUIState):
+    if s.init_thumb_tex != UInt32(0):
+        Backend.destroy_texture(s.init_thumb_tex)
+        s.init_thumb_tex = UInt32(0)
+    s.init_thumb_w = 0
+    s.init_thumb_h = 0
+    s.init_validated_path = String("")
+
+
+def _validate_init_image(mut s: InferenceUIState):
+    """P7: decode the init-image path via MOJO-libs image (png/jpeg/webp),
+    downscale to ~128 px (MOJO-libs resize_bilinear) and upload the thumbnail
+    texture. Errors land in init_status, never crash."""
+    var path = s.store.m_init_image.copy()
+    _clear_init_thumb(s)
+    if path.byte_length() == 0:
+        s.init_status = String("no init image (txt2img)")
+        return
+    try:
+        var img = decode_image_any(path)
+        var tw = img.width
+        var th = img.height
+        if tw >= th and tw > 128:
+            th = (th * 128) // tw
+            tw = 128
+        elif th > tw and th > 128:
+            tw = (tw * 128) // th
+            th = 128
+        if tw < 1:
+            tw = 1
+        if th < 1:
+            th = 1
+        var thumb = resize_bilinear(img, tw, th)
+        var rgba = image_to_rgba_bytes(thumb)
+        var tex = Backend.make_texture_rgba(Int32(tw), Int32(th), rgba)
+        if tex == UInt32(0):
+            s.init_status = String("thumbnail upload failed (no GL context?)")
+            return
+        s.init_thumb_tex = tex
+        s.init_thumb_w = Int32(tw)
+        s.init_thumb_h = Int32(th)
+        s.init_validated_path = path.copy()
+        s.init_status = (
+            String("ok: ") + String(img.width) + String("x") + String(img.height)
+        )
+    except e:
+        s.init_status = String(e)
+
+
+def _reset_batch_strip(mut s: InferenceUIState):
+    """P13: a new Generate starts a fresh batch strip."""
+    for i in range(len(s.batch_tex)):
+        if s.batch_tex[i] != UInt32(0):
+            Backend.destroy_texture(s.batch_tex[i])
+    s.batch_job_ids = List[String]()
+    s.batch_paths = List[String]()
+    s.batch_tex = List[UInt32]()
+    s.batch_sel = 0
+
+
+def _batch_select(mut s: InferenceUIState, idx: Int):
+    """P13: thumbnail click — swap the full preview to that job's output."""
+    if idx < 0 or idx >= len(s.batch_paths):
+        return
+    s.batch_sel = idx
+    s.zrt.result_path = s.batch_paths[idx].copy()
+    s.zrt.result_pixels = List[UInt8]()
+    s.zrt.result_job_id += 1  # forces _sync_result_texture to re-upload
+    s.menu_status = String("preview: ") + s.batch_job_ids[idx]
+
+
+def _batch_reuse_selected(mut s: InferenceUIState):
+    """P13: make the selected batch job's params the current params (PNG
+    tEXt -> H2 dispatch), same as a history reuse click."""
+    if s.batch_sel < 0 or s.batch_sel >= len(s.batch_paths):
+        return
+    try:
+        var p = GenParams.from_json(
+            read_genparams_from_png(s.batch_paths[s.batch_sel])
+        )
+        s.store.set(p^)
+        s.menu_status = (
+            String("params restored from ") + s.batch_job_ids[s.batch_sel]
+        )
+    except e:
+        s.menu_status = String("batch reuse-params failed: ") + String(e)
+
+
 def _drain_daemon_done(mut s: InferenceUIState):
     """Move the bridge's terminal-job events into persistent history (P14)."""
     var n = len(s.zrt.daemon_done_events)
@@ -520,6 +674,16 @@ def _drain_daemon_done(mut s: InferenceUIState):
             if s.starred_ids[k] == item.job_id:
                 item.starred = True
                 break
+        # P13: feed the batch strip (this session's finished outputs)
+        var in_batch = False
+        for k in range(len(s.batch_job_ids)):
+            if s.batch_job_ids[k] == ev.id:
+                in_batch = True
+                break
+        if not in_batch and len(s.batch_paths) < 8:
+            s.batch_job_ids.append(ev.id.copy())
+            s.batch_paths.append(item.output_path.copy())
+            s.batch_tex.append(UInt32(0))  # thumb loads lazily in the strip
         # de-dup (a poll can race a db reload)
         var seen = False
         for k in range(len(s.gallery)):
@@ -632,9 +796,18 @@ def _submit_generate(mut s: InferenceUIState):
     if p.seed < 0:
         s.pseudo_rng = s.pseudo_rng * UInt32(1664525) + UInt32(1013904223)
         p.seed = Int(s.pseudo_rng % UInt32(1000000))
+    # P9/P10: resolve prompt syntax against the concrete seed (prompt_raw
+    # keeps the original; <lora:> merges into the stack; <random:> picks
+    # deterministically per seed). Malformed syntax -> status note only.
+    var syntax_notes = List[String]()
+    _resolve_prompt_syntax(p, syntax_notes)
+    if len(syntax_notes) > 0:
+        s.menu_status = String("prompt syntax: ") + join_notes(syntax_notes)
+        print("[gen-screen] prompt syntax:", join_notes(syntax_notes))
     if not p.same_as(s.store.params):
         try:
-            s.store.set(p.copy())  # H2: the submitted seed IS the param state
+            # H2: the submitted seed + resolved prompt ARE the param state
+            s.store.set(p.copy())
         except e:
             print("[gen-screen] seed store.set failed:", String(e))
     var arch = _selected_arch(s)
@@ -645,10 +818,21 @@ def _submit_generate(mut s: InferenceUIState):
         daemon_refresh_health(s.zrt)  # health-check on Generate (bridge spec)
         route_daemon = s.zrt.daemon_ok
     if route_daemon:
+        _reset_batch_strip(s)  # P13: a new Generate starts a fresh strip
         var all_ok = True
         for k in range(p.images):  # P6: one daemon job per image
             var pk = p.copy()
             pk.seed = p.seed + k
+            if k > 0 and pk.prompt_raw.byte_length() > 0:
+                # P10: per-image seeds re-resolve <random:> from the raw
+                # prompt (image k's pick is deterministic for seed+k)
+                var nk = List[String]()
+                var pr = pk.prompt_raw.copy()
+                pk.prompt_raw = String("")
+                pk.prompt = pr.copy()
+                _resolve_prompt_syntax(pk, nk)
+                if pk.prompt_raw.byte_length() == 0:
+                    pk.prompt_raw = pr^  # keep raw even if k's pick == raw
             try:
                 if not daemon_submit_params(
                     s.model, s.zrt, pk.to_json(), pk.width, pk.height, pk.steps
@@ -1289,6 +1473,47 @@ def _section_batch(mut s: InferenceUIState) raises:
             s.store.d_images = True
 
 
+def _section_init_image(mut s: InferenceUIState) raises:
+    """P7: init image (img2img) — path field + Validate (MOJO-libs decode +
+    128px thumbnail) + creativity slider 0..1 + Clear."""
+    ref ctx = s.ctx
+    if collapsing_header(ctx, String("Init image"), s.sec_init):
+        ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
+        label(ctx, String("Path:"))
+        if text_edit(ctx, String("init_path"), s.store.m_init_image,
+                     s.init_path_state):
+            s.store.d_init_image = True
+        ctx.layout_row(_row2(_px(s, 170), _px(s, 170)), _px(s, 26))
+        if button(ctx, String("Validate")):
+            s.store.d_init_image = True   # commit the typed path this frame
+            _validate_init_image(s)
+        if button(ctx, String("Clear init")):
+            s.store.m_init_image = String("")
+            s.init_path_state = TextEditState(single_line=True)
+            s.store.d_init_image = True
+            _clear_init_thumb(s)
+            s.init_status = String("cleared (txt2img)")
+        ctx.layout_row(_row2(_left_label_w(s), _left_field_w(s)), _px(s, 28))
+        label(ctx, String("Creativity: ")
+              + String(Float64(Int(s.store.m_creativity * 100.0)) / 100.0))
+        if slider(ctx, s.store.m_creativity, Float32(0.0), Float32(1.0),
+                  String("creativity")):
+            s.store.d_creativity = True
+        if s.init_status.byte_length() > 0:
+            ctx.layout_row(_row1(_left_full_w(s)), _px(s, 20))
+            label(ctx, s.init_status)
+        if s.init_thumb_tex != UInt32(0):
+            # thumbnail slot (P7): uploaded like the output preview
+            var th = Float32(Int(s.init_thumb_h))
+            var tw = Float32(Int(s.init_thumb_w))
+            ctx.layout_row(_row1(_left_full_w(s)), Int32(Int(th)) + _px(s, 8))
+            var slot = ctx.layout_next()
+            var rect = Rect(slot.x + _fpx(s, 4.0), slot.y + _fpx(s, 4.0), tw, th)
+            _ = ctx.commands.emit_image(
+                rect^, s.init_thumb_tex, Color(255, 255, 255, 255)
+            )
+
+
 comptime PRESET_PAGE = 10  # F7: dropdown rows per page (50 entries overflow)
 
 
@@ -1408,6 +1633,7 @@ def _left_panel(mut s: InferenceUIState) raises:
     _section_seed(s)
     _section_lora(s)
     _section_batch(s)
+    _section_init_image(s)
     _section_presets(s)
     _section_advanced(s)
 
@@ -1445,10 +1671,13 @@ def _center_panel(mut s: InferenceUIState, col_x: Float32) raises:
         s.store.m_seed_text = String(Int(s.pseudo_rng % UInt32(1000000)))
         s.store.d_seed = True
 
-    # image preview
-    ctx.layout_row(_row1(_center_w(s)), _px(s, 460))
+    # image preview (shorter when the P13 batch strip needs the room below)
+    var prev_h: Int32 = 460
+    if len(s.batch_paths) >= 2:
+        prev_h = 330
+    ctx.layout_row(_row1(_center_w(s)), _px(s, prev_h))
     var slot = ctx.layout_next()
-    var side: Float32 = _fpx(s, 440.0)
+    var side: Float32 = _fpx(s, Float32(Int(prev_h)) - 20.0)
     if side > slot.w - _fpx(s, 20.0):
         side = slot.w - _fpx(s, 20.0)
     if side > slot.h - _fpx(s, 20.0):
@@ -1459,6 +1688,45 @@ def _center_panel(mut s: InferenceUIState, col_x: Float32) raises:
         side, side,
     )
     _draw_preview(ctx, img, s.model, s.font_id, s.zrt.texture_id, s.scale, _font_body(s))
+
+    # P13: batch thumbnail strip (this Generate's outputs, images > 1).
+    # Thumb textures load lazily; the [n] button under a thumb swaps the
+    # full preview to that job; [use params] re-applies its PNG-tEXt params.
+    if len(s.batch_paths) >= 2:
+        var n = len(s.batch_paths)
+        var cell = _px(s, 84)
+        var widths = List[Int32]()
+        for _ in range(n):
+            widths.append(cell)
+        ctx.layout_row(widths.copy(), _px(s, 84))
+        for i in range(n):
+            var slot2 = ctx.layout_next()
+            if s.batch_tex[i] == UInt32(0):
+                var loaded = Backend.load_texture_file_info(
+                    s.batch_paths[i], Int32(96), Int32(96)
+                )
+                s.batch_tex[i] = loaded.texture_id
+            if s.batch_tex[i] != UInt32(0):
+                var side2 = slot2.w - _fpx(s, 6.0)
+                if side2 > slot2.h - _fpx(s, 4.0):
+                    side2 = slot2.h - _fpx(s, 4.0)
+                var trect = Rect(
+                    slot2.x + _fpx(s, 3.0), slot2.y + _fpx(s, 2.0), side2, side2
+                )
+                var tint = Color(255, 255, 255, 255)
+                if i != s.batch_sel:
+                    tint = Color(170, 170, 170, 255)  # selected = full bright
+                _ = ctx.commands.emit_image(trect^, s.batch_tex[i], tint^)
+        ctx.layout_row(widths^, _px(s, 24))
+        for i in range(n):
+            var mark = String("[") + String(i + 1) + String("]")
+            if i == s.batch_sel:
+                mark = String("[*") + String(i + 1) + String("]")
+            if button(ctx, mark):
+                _batch_select(s, i)
+        ctx.layout_row(_row1(_px(s, 240)), _px(s, 24))
+        if button(ctx, String("use params of selected")):
+            _batch_reuse_selected(s)
 
     # progress bar + readout
     ctx.layout_row(_row1(_center_w(s)), _px(s, 18))
@@ -2118,6 +2386,46 @@ def _frame() -> None:
                 if sp[].presets[i] == String("uigate-roundtrip"):
                     sp[].preset_index = Int32(i)
             _do_load_preset(sp[])
+    elif sp[].autogen_mode == 6:
+        # P13 batch gate (G3d): submit a 3-image batch; once all 3 thumbs are
+        # in the strip, wait ~4 s (screenshot window), then select the MIDDLE
+        # thumb via the SAME function the [2] button calls (preview swap).
+        if sp[].frame_no == 150:
+            _submit_generate(sp[])
+        if len(sp[].batch_paths) >= 3 and sp[].autogen_stamp == 0:
+            sp[].autogen_stamp = sp[].frame_no
+            print("[ui-gate] batch strip full at frame", sp[].frame_no)
+        if sp[].autogen_stamp > 0 and sp[].frame_no >= sp[].autogen_stamp + 240:
+            _batch_select(sp[], 1)
+            print("[ui-gate] selected middle batch thumb -> preview swap")
+            sp[].autogen_mode = 62  # done
+    elif sp[].autogen_mode == 7:
+        # P7 img2img gate (G3c UI evidence): read init path (+ optional
+        # creativity) from /tmp/serenityui_init_path.txt, validate (thumbnail
+        # upload — the SAME function the Validate button calls), then submit.
+        if sp[].frame_no == 60:
+            try:
+                with open(String("/tmp/serenityui_init_path.txt"), String("r")) as f:
+                    var lines = f.read().split(String("\n"))
+                    if len(lines) > 0:
+                        # the text_edit widget binds m_init_image directly
+                        # (TextEditState only tracks cursor/selection)
+                        sp[].store.m_init_image = String(lines[0])
+                        sp[].store.d_init_image = True
+                    if len(lines) > 1 and String(lines[1]).byte_length() > 0:
+                        var cok = False
+                        var c = parse_float_strict(String(lines[1]), cok)
+                        if cok:
+                            sp[].store.m_creativity = Float32(c)
+                            sp[].store.d_creativity = True
+                _validate_init_image(sp[])
+                print("[ui-gate] init image set:", sp[].store.m_init_image,
+                      "creativity", sp[].store.m_creativity,
+                      "status:", sp[].init_status)
+            except e:
+                print("[ui-gate] init path file read failed:", String(e))
+        if sp[].frame_no == 150:
+            _submit_generate(sp[])
 
     sp[].ctx.begin_frame(Vec2(sp[].win_w, sp[].win_h))
     Backend.frame_begin(Color(18, 18, 22, 255))
@@ -2293,6 +2601,137 @@ def _selftest_preset() raises:
     print("[selftest] PASS preset round-trip:", name)
 
 
+def _selftest_p3_stub() raises:
+    """G3b headless (stub daemon): a prompt with all three syntaxes ->
+    the daemon receives the RESOLVED prompt + the merged LoRA list (deduped
+    vs the UI stack); genparams carry prompt_raw + init_image + creativity;
+    <random:> is deterministic per seed."""
+    print("[selftest-p3] === G3b stub e2e: prompt syntax + img2img params ===")
+    var s = InferenceUIState()
+    if not s.zrt.daemon_ok:
+        raise Error("selftest-p3: daemon not running on 127.0.0.1:7801")
+
+    # ── job 0: a plain quick job to mint an init-image PNG ──
+    var p0 = s.store.params.copy()
+    p0.prompt = String("plain init-image source")
+    p0.steps = 2
+    p0.seed = 1001
+    p0.images = 1
+    s.store.set(p0^)
+    _refresh_store(s)
+    _submit_generate(s)
+    if len(s.zrt.daemon_submitted) == 0:
+        raise Error("selftest-p3: job0 submit failed: " + s.menu_status)
+    var job0 = _selftest_wait_terminal(
+        s.zrt.daemon_submitted[len(s.zrt.daemon_submitted) - 1], 600
+    )
+    if job0.state != String("done"):
+        raise Error("selftest-p3: job0 ended " + job0.state)
+    var init_png = absolutize_output_path(job0.output_path)
+    print("[selftest-p3] init-image source:", init_png)
+
+    # ── the syntax-loaded job (weight + lora + random + init image) ──
+    var lora_name = String("syntax-probe-lora")
+    if len(s.lora_names) > 0:
+        lora_name = s.lora_names[0].copy()
+    var raw = (
+        String("an (ornate:1.2) gate <lora:") + lora_name
+        + String(":0.7> at <random:dawn|dusk|midnight>")
+    )
+    var p = s.store.params.copy()
+    p.prompt = raw.copy()
+    p.prompt_raw = String("")
+    p.negative = String("blurry")
+    p.steps = 3
+    p.seed = 31415
+    p.images = 1
+    p.init_image = init_png.copy()
+    p.creativity = 0.4
+    p.loras = List[GenLora]()
+    p.loras.append(GenLora(lora_name.copy(), 1.5))  # dedup probe: UI stack wins
+    s.store.set(p^)
+    _refresh_store(s)
+    var n_before = len(s.zrt.daemon_submitted)
+    _submit_generate(s)
+    if len(s.zrt.daemon_submitted) <= n_before:
+        raise Error("selftest-p3: syntax job submit failed: " + s.menu_status)
+    print("[selftest-p3] submit #1:", s.zrt.last_submit_json)
+    var sub1 = GenParams.from_json(s.zrt.last_submit_json)
+    var fails = List[String]()
+    if sub1.prompt_raw != raw:
+        fails.append(String("prompt_raw != original: '") + sub1.prompt_raw + "'")
+    if sub1.prompt.find(String("<lora:")) >= 0 \
+            or sub1.prompt.find(String("<random:")) >= 0:
+        fails.append(String("resolved prompt still has tags: '") + sub1.prompt + "'")
+    if sub1.prompt.find(String("(ornate:1.2)")) < 0:
+        fails.append(String("weight syntax not passed through: '") + sub1.prompt + "'")
+    var got_pick = (
+        sub1.prompt.find(String("dawn")) >= 0
+        or sub1.prompt.find(String("dusk")) >= 0
+        or sub1.prompt.find(String("midnight")) >= 0
+    )
+    if not got_pick:
+        fails.append(String("<random:> pick missing: '") + sub1.prompt + "'")
+    if len(sub1.loras) != 1:
+        fails.append(String("lora rows = ") + String(len(sub1.loras)) + " want 1 (dedup)")
+    elif sub1.loras[0].name != lora_name or sub1.loras[0].weight != 1.5:
+        fails.append(
+            String("lora dedup lost the UI weight: ") + sub1.loras[0].name
+            + ":" + String(sub1.loras[0].weight) + " want " + lora_name + ":1.5"
+        )
+    if sub1.init_image != init_png:
+        fails.append(String("init_image not echoed: '") + sub1.init_image + "'")
+    if sub1.creativity != 0.4:
+        fails.append(String("creativity = ") + String(sub1.creativity) + " want 0.4")
+    if len(fails) > 0:
+        for i in range(len(fails)):
+            print("[selftest-p3] FAIL", fails[i])
+        raise Error("selftest-p3: submitted JSON wrong")
+    print("[selftest-p3] PASS resolved prompt + merged lora + img2img params")
+
+    var job1 = _selftest_wait_terminal(
+        s.zrt.daemon_submitted[len(s.zrt.daemon_submitted) - 1], 600
+    )
+    if job1.state != String("done"):
+        raise Error("selftest-p3: syntax job ended " + job1.state)
+    var png_json = read_genparams_from_png(absolutize_output_path(job1.output_path))
+    var got = GenParams.from_json(png_json)
+    if got.prompt_raw != raw or got.prompt != sub1.prompt \
+            or got.init_image != init_png or got.creativity != 0.4:
+        print("[selftest-p3] PNG tEXt:", png_json)
+        raise Error("selftest-p3: PNG tEXt genparams lost syntax/img2img fields")
+    print("[selftest-p3] PASS PNG tEXt carries prompt_raw + init_image + creativity")
+
+    # ── determinism: same seed -> identical resolution on resubmit ──
+    _submit_generate(s)
+    var sub2 = GenParams.from_json(s.zrt.last_submit_json)
+    if sub2.prompt != sub1.prompt:
+        raise Error(
+            "selftest-p3: same-seed resolution differs: '" + sub1.prompt
+            + "' vs '" + sub2.prompt + "'"
+        )
+    print("[selftest-p3] PASS same seed -> same <random:> resolution")
+
+    # different seed: resolution follows the parser exactly (may differ)
+    var p3 = s.store.params.copy()
+    p3.seed = 999
+    s.store.set(p3^)
+    _refresh_store(s)
+    _submit_generate(s)
+    var sub3 = GenParams.from_json(s.zrt.last_submit_json)
+    var expect3 = resolve_prompt(raw, 999)
+    # the submitted prompt must equal the parser's pick for seed 999 with the
+    # lora tag removed (resolve_prompt does both)
+    if sub3.prompt != expect3.resolved:
+        raise Error(
+            "selftest-p3: seed-999 resolution mismatch: '" + sub3.prompt
+            + "' vs parser '" + expect3.resolved + "'"
+        )
+    print("[selftest-p3] seed 31415 ->", sub1.prompt)
+    print("[selftest-p3] seed   999 ->", sub3.prompt)
+    print("[selftest-p3] ALL PASS")
+
+
 def _diff_genparams(a: GenParams, b: GenParams) -> List[String]:
     """Full field diff (printed by the mirrors gate)."""
     var d = List[String]()
@@ -2300,6 +2739,9 @@ def _diff_genparams(a: GenParams, b: GenParams) -> List[String]:
         d.append(String("model: '") + a.model + String("' vs '") + b.model + String("'"))
     if a.prompt != b.prompt:
         d.append(String("prompt: '") + a.prompt + String("' vs '") + b.prompt + String("'"))
+    if a.prompt_raw != b.prompt_raw:
+        d.append(String("prompt_raw: '") + a.prompt_raw + String("' vs '")
+                 + b.prompt_raw + String("'"))
     if a.negative != b.negative:
         d.append(String("negative: '") + a.negative + String("' vs '") + b.negative + String("'"))
     if a.width != b.width:
@@ -2324,6 +2766,12 @@ def _diff_genparams(a: GenParams, b: GenParams) -> List[String]:
                  + String(" vs ") + String(b.variation_strength))
     if a.images != b.images:
         d.append(String("images: ") + String(a.images) + String(" vs ") + String(b.images))
+    if a.init_image != b.init_image:
+        d.append(String("init_image: '") + a.init_image + String("' vs '")
+                 + b.init_image + String("'"))
+    if a.creativity != b.creativity:
+        d.append(String("creativity: ") + String(a.creativity)
+                 + String(" vs ") + String(b.creativity))
     if len(a.loras) != len(b.loras):
         d.append(String("loras: ") + String(len(a.loras)) + String(" vs ")
                  + String(len(b.loras)) + String(" rows"))
@@ -2472,10 +2920,23 @@ def main() raises:
             or a == String("--selftest-ui-preset")
             or a == String("--selftest-ui-gpu")
             or a == String("--selftest-mirrors")
+            or a == String("--selftest-syntax")
+            or a == String("--selftest-p3")
+            or a == String("--selftest-ui-batch")
+            or a == String("--selftest-ui-img2img")
         ):
             run_mode = a^
     if run_mode == String("--selftest-mirrors"):
         _selftest_mirrors()
+        return
+    if run_mode == String("--selftest-syntax"):
+        # G3a: the prompt-syntax parser unit gate (10+ cases)
+        selftest_prompt_syntax()
+        return
+    if run_mode == String("--selftest-p3"):
+        # G3b: stub e2e — syntax resolution + lora merge + img2img params
+        selftest_prompt_syntax()
+        _selftest_p3_stub()
         return
     if run_mode == String("--selftest"):
         _selftest_daemon_e2e()
@@ -2513,6 +2974,31 @@ def main() raises:
         # a 50-step job so the auto-cancel lands mid-denoise
         var p = state.store.params.copy()
         p.steps = 50
+        state.store.set(p^)
+    elif run_mode == String("--selftest-ui-batch"):
+        # G3d: 3-image stub batch -> thumbnail strip -> middle-click swap
+        state.autogen_mode = 6
+        var p = state.store.params.copy()
+        p.prompt = String("batch-gate: paper lantern on a pier")
+        p.steps = 6
+        p.seed = 5150   # 3 jobs at seeds 5150/5151/5152 -> distinct gradients
+        p.images = 3
+        state.store.set(p^)
+    elif run_mode == String("--selftest-ui-img2img"):
+        # G3c UI evidence: init image (path read from
+        # /tmp/serenityui_init_path.txt) + creativity + thumbnail + submit.
+        state.autogen_mode = 7
+        # collapse the upper sections so the Init-image section (thumbnail)
+        # is on-screen for the gate screenshot
+        state.sec_sampling = False
+        state.sec_seed = False
+        state.sec_lora = False
+        var p = state.store.params.copy()
+        p.prompt = String("the same scene but everything is deep red, "
+                          "crimson tones, photo")
+        p.steps = 20
+        p.seed = 777
+        p.images = 1
         state.store.set(p^)
     elif run_mode == String("--selftest-ui-reuse"):
         state.autogen_mode = 3
