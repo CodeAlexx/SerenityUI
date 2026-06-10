@@ -56,3 +56,42 @@ advertising), so neither path is reachable from /v1/generate.
   tensors are freed to the DeviceContext pool but the pool does not return
   the VRAM between jobs (nvidia-smi stays high while idle). Real fix: pool
   trim/release-to-OS hook between jobs, or per-job sub-pool with reset.
+
+  PHASE-4 INVESTIGATION (2026-06-10, MEASURED, dispatch daemon @ this build):
+  ROOT CAUSE confirmed and the proposed fix DOES NOT REACH the pool —
+  documented here so the next attempt doesn't re-walk it.
+    * The Mojo GPU runtime's `DeviceContext` (std.gpu.host) is a SINGLETON (ctx.id()==0 for every instance,
+      one shared default stream + ONE caching allocator). Dropping a backend
+      drops its DeviceBuffers (AsyncRT_DeviceBuffer_release) back to the Mojo runtime's
+      caching pool, but the singleton's refcount NEVER hits zero while any
+      DeviceContext value lives (the daemon always holds one), so the pool is
+      never destroyed → bytes never return to the OS. nvidia-smi stays at the
+      HIGH-WATER MARK (measured: zimage job peaks 21.4 GB resident-DiT(13) +
+      per-job Qwen3-4B encoder(7.5); pool then pins ~21 GB while idle).
+    * cuMemPoolTrimTo HOOK ADDED + WIRED (serenitymojo/offload/vmm_cuda.mojo
+      cu_device_get_mempool / cu_mempool_trim_to / cu_mempool_trim_current;
+      called from dispatch_backend._free_current + between_jobs_trim + the
+      daemon job-boundary). It RECLAIMS 0 MiB — the Mojo runtime's (AsyncRT) allocator does NOT
+      allocate from the CUDA *default* stream-ordered mempool, so a
+      driver-level cuMemPoolTrimTo on that pool finds nothing of the runtime's to
+      free. AsyncRT references cuMemPool* but uses its own pool/strategy; the
+      trim is a no-op against it. (The hook is left in place — harmless, and
+      correct if a future Mojo-runtime build routes through the default pool.)
+    * CONSEQUENCE for switching (G-PERF2): zimage->qwen OOMs. After a zimage
+      job the pool is pinned at ~21 GB; the incoming qwen 1024² CFG forward
+      activations push past 24 GB (CUDA_ERROR_OUT_OF_MEMORY in the first
+      denoise step). The SWITCH MECHANISM is correct (free old backend, build
+      new, /v1/health tracks resident); qwen->zimage->qwen (heaviest peak
+      FIRST, its pool absorbs the lighter model) round-trips fine. zimage->
+      qwen->zimage gives done/FAILED/done.
+    * WHAT'S ACTUALLY NEEDED (none available in this build):
+      (a) a Mojo-runtime-internal "release cached buffers to OS" API on DeviceContext
+          (the docstring says __del__ frees cached buffers at refcount 0 — we
+          need that reachable WITHOUT destroying the singleton), or
+      (b) the Mojo runtime routing its allocator through the CUDA stream-ordered default
+          pool so cuMemPoolTrimTo binds, or
+      (c) PROCESS ISOLATION: run each resident model in a child process; a
+          model switch = kill child + spawn new (the OS reclaims on exit).
+          This is the robust 24 GB answer and is the recommended Phase-5
+          change (the daemon already has a clean GenBackend seam to fork on).
+    NOT FAKED: 1024 stays gated and the gate reports the OOM honestly.
