@@ -13,11 +13,23 @@ fixes flow in. It vendors neither.
 
 ## Layout
 
+The app is a `src/` package, split by concern (originally one 3k-line file):
+
 ```
 serenityUI/
-  pixi.toml              # own env; include paths to MojoUI + serenitymojo
-  src/serenity_ui_main.mojo   # the app (seeded from MojoUI m8, extended)
+  pixi.toml                  # own env; include paths to MojoUI + serenitymojo
+  src/
+    __init__.mojo            # package marker
+    app_core.mojo            # window/layout constants + InferenceUIState +
+                             #   helpers/actions/catalog/layout (the model layer)
+    sections.mojo            # left-panel param sections, preview, 3 panels
+    chrome_frame.mojo        # title/menu/status chrome, node panel, _ui frame
+    selftest.mojo            # headless --selftest suites
+    serenity_ui_main.mojo    # entry point: _frame callback + main()
 ```
+
+Module layering is strictly one-directional (each imports only earlier ones):
+`app_core` → `sections` → `chrome_frame` → `selftest` → `serenity_ui_main`.
 
 ## Build / run
 
