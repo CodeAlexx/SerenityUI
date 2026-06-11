@@ -1,8 +1,8 @@
-# SerenityUI campaign TODO (paused 2026-06-10, "stop all")
+# SerenityUI campaign TODO (updated 2026-06-10; gen-screen campaign phases 1-4 COMPLETE — see verdict at bottom)
 
 Goal: SwarmUI-class experience, pure Mojo. Audit: SWARMUI_GAP_AUDIT_2026-06-10.md.
-Bridge contract: DAEMON_BRIDGE_SPEC.md. Everything below CPU-buildable except
-where marked GPU.
+Bridge contract: DAEMON_BRIDGE_SPEC.md. Campaign plan + per-phase gates:
+GENSCREEN_PARITY_PLAN.md.
 
 ## DONE (verified + pushed)
 - MOJO-libs validated under serenitymojo toolchain: json 26/26, sqlite 52/52
@@ -12,30 +12,32 @@ where marked GPU.
   localhost:7801, POST /v1/generate, jobs/cancel/health, WS /v1/progress
   (full RFC6455), stub backend, genparams in PNG tEXt, jobs.db via pure-Mojo
   sqlite. All gates re-run by orchestrator (curl e2e, PIL, sqlite dump).
+- **Gen-screen parity campaign phases 1-4, all skeptic-FIT** (see "CAMPAIGN
+  STATUS" at bottom; serenityUI `7190263`/`9bb7c61`/`0f0179c`/`539b8d2`,
+  mojodiffusion `cd185d6`/`adffe5e`/`7fb11c1`/`9f60845`/`0932be8`):
+  - Z-Image GenBackend COMPLETE (the former "in flight" item) + model scanner
+    + /v1/models + WS preview field (mojodiffusion `cd185d6`).
+  - UI daemon bridge w/ CLI fallback, params column P1-P6, presets P8,
+    daemon generate + queue rail P11-P12, history/reuse-params/stars P14-P16.
+  - img2img (init image + creativity) P7, prompt syntax ((w)/<lora>/<random>)
+    P10, batch thumbnails P13.
+  - Phase 4: Qwen-Image backend + model-switch dispatch (`0932be8`).
+- CLIP + T5 tokenizers parity-verified bit-exact vs HF (2026-06-08; re-verified
+  2026-06-10) — see MODEL_WIRING_STATUS.md.
 
-## IN FLIGHT (stopped mid-gate by "stop all")
-1. **Z-Image GenBackend** — `serenitymojo/serve/zimage_backend.mojo` WRITTEN,
-   UNCOMMITTED. Agent killed during its first e2e: denoise 20/20 done, stopped
-   in VAE decode right after applying a DiT-release-before-decode fix.
-   RESUME: relaunch builder against existing file; remaining gates = e2e two
-   different prompts → visibly different images + per-step progress + cancel
-   mid-denoise + job-2 latency (resident-weights win) + tEXt params. [GPU]
-
-## NEXT (order)
-2. UI bridge switch (per DAEMON_BRIDGE_SPEC.md): inference_graph_bridge.mojo
-   gains daemon client (MOJO-libs http client) w/ health-check + CLI fallback;
-   poll /v1/jobs for progress; cancel; queue rail from daemon. Add
-   -I /home/alex/MOJO-libs to serenityUI build.
-3. P0.2 model/LoRA disk scanner (+ /v1/models endpoint) → replaces fixed
-   12-entry dropdown; multi-LoRA stack w/ weights (runtime-add only).
-4. P0.3 gallery tab: jobs.db + output-dir browse, thumbnails (MOJO-libs image
-   resize), "reuse params" from PNG tEXt, stars.
-5. P0.4 presets save/load + UI state persistence.
-6. P1: img2img/inpaint (init image via MOJO-libs jpeg/png decode + creativity
-   slider + minimal mask), video tab (LTX2 refhq/NAVA backends), aspect
-   presets, (text:weight)/<lora:> prompt syntax, upscaler tab, queue reorder.
-7. Daemon hardening: /v1/models, WS preview slot (needs cheap latent preview),
-   multi-model backend registry (one resident model at a time, swap on demand).
+## REMAINING (order)
+1. F3 GPU confirm (deferred, one run owed): post-OOM CUDA-context recovery —
+   zimage->qwen[FAILED]->zimage = done/FAILED/done. [GPU]
+2. Phase 5: process-isolation-per-model in the daemon (the robust 24 GB fix
+   for the ~21 GB pool-retention limit; GenBackend seam is fork-ready).
+3. Wire verified CLIP/T5 ids into the sidecar/prompt-blind model adapters
+   (Chroma/SD3.5/SDXL/Anima/FLUX) → prove one image each on GPU
+   (MODEL_WIRING_STATUS.md "Next unlock"); fix umt5 trailing-whitespace 7/8.
+4. P1 leftovers: video tab (LTX2 refhq/NAVA backends), inpaint mask, upscaler
+   tab, queue reorder; WS live preview content (slot plumbed, empty — needs
+   cheap latent preview, measure first).
+5. Extend daemon residency/switching to remaining prompt-ready models
+   (Klein 9B/4B, ERNIE) per G-PERF1/G-PERF2.
 
 ## Parallel campaigns parked elsewhere
 - LTX2: serenitymojo/docs/LTX2_TODO.md (quality arms + trainer stages 2+).
@@ -121,12 +123,21 @@ Verified clean (static + CPU compile):
     honestly documented (AsyncRT allocator not bound by cuMemPoolTrimTo).
   * _kind_for_model fail-loud on unknown; free-then-construct at job boundary; residency tracked.
 
-OPEN GAP — F3 (GPU-only, DEFERRED to a GPU-free window):
-  Post-OOM CUDA-context recovery for the job AFTER a failed switch is unproven.
-  Static path is clean (OOM -> job FAILED + _clear_job, daemon worker survives), but whether
-  the CUDA context recovers enough to serve the NEXT job after an in-denoise
-  CUDA_ERROR_OUT_OF_MEMORY needs one real GPU run (zimage->qwen[FAILED]->zimage = done/FAILED/done).
-  Single confirming run owed when the user clears the GPU. Not a known defect — an unverified claim.
+F3 — POST-OOM CUDA-CONTEXT RECOVERY: **PASS (measured 2026-06-11, GPU run)**.
+  Real dispatch-daemon run, 3 jobs, authoritative /v1/jobs states:
+    job-0010 zimage -> DONE    (loaded 11.5 GB DiT, ran 4 steps, decoded)
+    job-0011 qwen   -> FAILED  (start() raised under the pinned ~21 GB pool — the
+                                documented OOM limit; GPU at 21416 MiB when qwen tried 1024² load)
+    job-0012 zimage -> DONE    (freed half-built qwen, rebuilt zimage, loaded, ran -> done)
+  => the daemon SURVIVES the failed switch and the NEXT job recovers fully. Process
+     exit then released the whole pool: 21416 -> 788 MiB (clean OS reclaim).
+  Caveat: did not re-capture the literal CUDA_ERROR_OUT_OF_MEMORY string this run
+  (sqlite3 CLI absent; error is in jobs.db + /v1/job error field). The recovery
+  CLAIM — next job serves after a failed switch — is what's measured-PASS.
+  OBSERVABILITY FIX (serenitymojo, this commit): the start()-failure path marked the
+  job failed but never printed to stdout (only step()-failures logged "-> failed").
+  This silent path is what made the first F3 run ambiguous. Added a symmetric
+  print("job ... -> failed (start): <error>"). Daemon rebuild: see commit.
 
 DOCUMENTED-ACCEPTED limit (-> Phase 5): ~21 GB pool retention between jobs;
   process-isolation-per-model is the robust 24 GB fix (daemon GenBackend seam is fork-ready).
@@ -135,4 +146,6 @@ CAMPAIGN STATUS: Phases 1-4 all skeptic-FIT. Pure-Mojo SwarmUI gen-screen clone 
   stub/zimage/qwen backends, model scan + /v1/models, dispatch + job-boundary switching,
   img2img, LoRA stack, history pager + PNG tEXt genparams, presets, prompt syntax
   (weights/<lora>/<random>), daemon HTTP+WS+SQLite (pure Mojo), H1-H4 node-sync hooks baked.
-  Remaining: F3 GPU confirm (deferred) + Phase-5 process isolation (future upgrade).
+  F3 post-OOM recovery: MEASURED-PASS (above). UI<->daemon e2e (--selftest): ALL PASS
+  (CPU, stub daemon — genparams H1 round-trip, H2 observer, cancel, double-cancel->409, preset).
+  Remaining: Phase-5 process isolation (future node-graph-backend upgrade) — only open item.
