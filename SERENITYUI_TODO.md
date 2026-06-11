@@ -95,3 +95,44 @@ advertising), so neither path is reachable from /v1/generate.
           This is the robust 24 GB answer and is the recommended Phase-5
           change (the daemon already has a clean GenBackend seam to fork on).
     NOT FAKED: 1024 stays gated and the gate reports the OOM honestly.
+
+---
+
+## PHASE 4 — SKEPTIC VERDICT: FIT (2026-06-11)
+
+Builder: Qwen-Image backend + model-switch dispatch + VRAM diagnosis (serenitymojo 0932be8).
+Skeptic (ade0e4b76d8bee5b9, CPU+static; GPU work halted mid-run on user OOM/remote-GPU):
+verdict = **PHASE 4 FIT — switching is real and honest**.
+
+Defects found + FIXED (serenitymojo 2855587):
+  * F1 vmm_cuda.mojo:140 — "MAX's DeviceContext caching allocator" -> "the Mojo
+    GPU runtime's (AsyncRT) DeviceContext caching allocator" (comment-only).
+  * F2 backend.mojo:138 — "pool-managed-by-MAX" -> "pool-managed-by-the-Mojo-runtime".
+  Repo-wide grep after fix: CLEAN, no MAX-engine prose mislabels remain.
+  Import-smoke build of both modules: exit 0.
+
+Verified clean (static + CPU compile):
+  * tiled decode (zimage_tiled_decode.mojo) compiles + instantiates; honestly
+    DEAD CODE (1024 zimage gated at start(), decoder never reached — not falsely advertised).
+  * F1 lora clamp: --selftest-syntax 14/14 PASS (out-of-range ->[-10,10] w/ note).
+  * Qwen backend is parameter-driven by construction (steps/cfg/seed/negative all wired);
+    non-1024/LoRA/img2img rejected at start() with clear errors; cancel-first in step().
+  * between_jobs_trim() genuinely called at every terminal job boundary; 0-MiB reclaim
+    honestly documented (AsyncRT allocator not bound by cuMemPoolTrimTo).
+  * _kind_for_model fail-loud on unknown; free-then-construct at job boundary; residency tracked.
+
+OPEN GAP — F3 (GPU-only, DEFERRED to a GPU-free window):
+  Post-OOM CUDA-context recovery for the job AFTER a failed switch is unproven.
+  Static path is clean (OOM -> job FAILED + _clear_job, daemon worker survives), but whether
+  the CUDA context recovers enough to serve the NEXT job after an in-denoise
+  CUDA_ERROR_OUT_OF_MEMORY needs one real GPU run (zimage->qwen[FAILED]->zimage = done/FAILED/done).
+  Single confirming run owed when the user clears the GPU. Not a known defect — an unverified claim.
+
+DOCUMENTED-ACCEPTED limit (-> Phase 5): ~21 GB pool retention between jobs;
+  process-isolation-per-model is the robust 24 GB fix (daemon GenBackend seam is fork-ready).
+
+CAMPAIGN STATUS: Phases 1-4 all skeptic-FIT. Pure-Mojo SwarmUI gen-screen clone delivered:
+  stub/zimage/qwen backends, model scan + /v1/models, dispatch + job-boundary switching,
+  img2img, LoRA stack, history pager + PNG tEXt genparams, presets, prompt syntax
+  (weights/<lora>/<random>), daemon HTTP+WS+SQLite (pure Mojo), H1-H4 node-sync hooks baked.
+  Remaining: F3 GPU confirm (deferred) + Phase-5 process isolation (future upgrade).
