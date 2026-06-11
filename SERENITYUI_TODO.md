@@ -1,10 +1,21 @@
-# SerenityUI campaign TODO (updated 2026-06-10; gen-screen campaign phases 1-4 COMPLETE — see verdict at bottom)
+# SerenityUI campaign TODO (updated 2026-06-11; gen-screen campaign phases 1-4 COMPLETE — see verdict at bottom)
 
 Goal: SwarmUI-class experience, pure Mojo. Audit: SWARMUI_GAP_AUDIT_2026-06-10.md.
 Bridge contract: DAEMON_BRIDGE_SPEC.md. Campaign plan + per-phase gates:
 GENSCREEN_PARITY_PLAN.md.
 
 ## DONE (verified + pushed)
+- **MojoUI text-input fixes landed** (MojoUI `21b771c`, 2026-06-11) — the
+  prompt boxes (`text_edit` / `text_area`) had three live bugs, all fixed:
+  (1) characters accumulating across focus changes → "extra chars"; fixed by
+  draining the C text buffer once per frame in `Context.begin_frame`.
+  (2) no key auto-repeat → backspace/arrows worked one-press-at-a-time; fixed
+  with a held-frames counter + `InputState.key_repeat()`.
+  (3) caret drift with no horizontal scroll; fixed with a caret-following
+  `scroll_x` + clip in `text_edit`.
+  Headless-verified (new `test_text_edit_repro` 6/6 + input/context/textedit/
+  text_edit/text_area suites); on-screen feel (held-repeat, caret tracking)
+  still needs a display to confirm.
 - MOJO-libs validated under serenitymojo toolchain: json 26/26, sqlite 52/52
   (pure Mojo, NO python/pytorch/FFI), png 18/18, jpeg 5/5, http 77/77.
 - MOJO-libs png tEXt chunks (encode+read, PIL-gated) — MOJO-libs `eedfea3`.
