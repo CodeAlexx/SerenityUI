@@ -106,4 +106,9 @@ Phase 2 builder/skeptic must enforce H1-H2 in the UI state refactor.
   (img2img corr monotone 0.994/0.988/0.893; syntax robust; batch seed-fanout
   correct). 9f60845 / MojoUI b3a2376. Residual F1 (parser lora-weight clamp/
   warn) folded into Phase-4 builder brief.
-- Phase 4 (multi-model residency + switching + VRAM): NEXT.
+- Phase 4 (multi-model residency + switching + VRAM): DONE — SKEPTIC VERDICT
+  FIT 2026-06-11 ("switching is real and honest"). Qwen-Image backend +
+  model-switch dispatch + VRAM diagnosis (serenitymojo 0932be8; F1/F2 comment
+  fixes 2855587). Open: F3 post-OOM-recovery GPU confirm (one run owed) +
+  ~21 GB pool-retention limit → Phase-5 process isolation. Full verdict +
+  VRAM root-cause in SERENITYUI_TODO.md.

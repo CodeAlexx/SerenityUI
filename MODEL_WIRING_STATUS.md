@@ -21,8 +21,10 @@ schema, read by `read_sample_prompt_config`) and builds the CLI on demand.
 Conditioning classes: **FULL** = prompt text → tokenize → encode → image, all
 pure-Mojo at runtime. **PRECACHE-MOJO** = same, via a pure-Mojo precache step
 run first. **SIDECAR** = real generate math, but conditioning needs an
-embedding/context file pre-encoded *outside* Mojo (CLIP/T5 tokenizer not
-ported). **PROMPT-BLIND** = feeds placeholder tokens; image ignores the prompt.
+embedding/context file pre-encoded *outside* Mojo (CLIP/T5 tokenizers are now
+ported + verified — see below — but the id→encoder wiring isn't done, so the
+sidecar feed is still what runs today). **PROMPT-BLIND** = feeds placeholder
+tokens; image ignores the prompt.
 
 | Model | Backend | New adapter | Conditioning | Prompt-driven today? |
 |---|---|---|---|---|
@@ -32,11 +34,11 @@ ported). **PROMPT-BLIND** = feeds placeholder tokens; image ignores the prompt.
 | Z-Image (turbo) | `zimage_generate` | no | FULL (Qwen3) | ✅ |
 | Qwen-Image | `qwenimage_sample_cli` | ✅ | FULL (Qwen2.5-VL) | ✅ |
 | ERNIE | `ernie_sample_cli` + ernie precache | ✅ | PRECACHE-MOJO¹ | ✅ (minor tokenizer caveat) |
-| Chroma | `chroma_sample_cli` | ✅ | SIDECAR (T5-XXL) | ⚠️ needs T5 sidecar |
-| SD 3.5 | `sd3_sample_cli` | ✅ | SIDECAR (CLIP-L/G + T5) | ⚠️ needs sidecar |
-| SDXL | `sdxl_sample_cli` | ✅ | SIDECAR (dual CLIP)² | ⚠️ needs sidecar |
-| Anima | `anima_serenity_cli` | ✅ | SIDECAR (Qwen3/T5 token arrays) | ⚠️ needs token sidecar |
-| FLUX Dev | `flux_sample_cli` | ✅ | PROMPT-BLIND³ | ❌ until CLIP+T5 tokenizers |
+| Chroma | `chroma_sample_cli` | ✅ | SIDECAR (T5-XXL) | ⚠️ tok ✅; needs encoder wiring |
+| SD 3.5 | `sd3_sample_cli` | ✅ | SIDECAR (CLIP-L/G + T5) | ⚠️ toks ✅; needs encoder wiring |
+| SDXL | `sdxl_sample_cli` | ✅ | SIDECAR (dual CLIP)² | ⚠️ toks ✅; needs encoder wiring |
+| Anima | `anima_serenity_cli` | ✅ | SIDECAR (Qwen3/T5 token arrays) | ⚠️ tok ✅ (umt5 7/8); needs wiring |
+| FLUX Dev | `flux_sample_cli` | ✅ | PROMPT-BLIND³ | ❌ toks ✅; until encoder wiring |
 | SD 1.5 | — none — | fail-loud | N/A (no pipeline) | ❌ unsupported |
 
 ¹ ERNIE precache uses `Qwen3Tokenizer(TOK_JSON)` (Qwen2 split) on a tokenizer
@@ -50,6 +52,9 @@ ported). **PROMPT-BLIND** = feeds placeholder tokens; image ignores the prompt.
   math is real but every image is prompt-independent.
 
 ## The (former) gating issue: text tokenizers — CLIP + T5 NOW VERIFIED
+**RE-VERIFIED 2026-06-10** (independent session): `t5_tokenizer_smoke` and
+`clip_tokenizer_smoke` rebuilt + rerun vs `parity/{t5,clip}_ref.py`, id lists
+diffed IDENTICAL.
 **UPDATE 2026-06-08:** CLIP BPE and T5 Unigram are ported AND parity-verified
 bit-exact vs HF on CPU (no GPU). Files: `serenitymojo/tokenizer/clip_tokenizer.mojo`,
 `t5_tokenizer.mojo` (+ argv-driven `_clip_generic_smoke.mojo` / `_t5_generic_smoke.mojo`
