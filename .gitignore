@@ -3,3 +3,7 @@
 /tmp/
 __pycache__/
 *.pyc
+
+# Internal working docs stay LOCAL — only README.md is published.
+*.md
+!README.md
